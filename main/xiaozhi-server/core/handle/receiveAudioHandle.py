@@ -24,6 +24,22 @@ async def handleAudioMessage(conn: "ConnectionHandler", audio):
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
+    # manual 模式下不打断正在播放的内容
+    if have_voice:
+        if conn.client_is_speaking and conn.client_listen_mode != "manual":
+            # 保护期：client_is_speaking 刚置为 True 后的 1.5 秒内不允许 VAD 自动 abort。
+            # 原因：用户说话中间的停顿可能让 ASR 提前吐字 -> send_stt_message 立刻设
+            # client_is_speaking=True，此时用户还没说完、LLM/TTS 也还没来得及回应。
+            # 这时若让 VAD 自动 abort，会打断服务端处理流程，且客户端收到的 tts stop
+            # 前面没有任何 sentence_start，导致客户端卡死在 Speaking 状态（假死）。
+            speaking_start = getattr(conn, "client_is_speaking_ts", 0)
+            guard_sec = 1.5
+            if speaking_start > 0 and (time.time() - speaking_start) < guard_sec:
+                conn.logger.bind(tag=TAG).info(
+                    f"VAD auto-abort suppressed: within speaking guard ({guard_sec}s)"
+                )
+            else:
+                await handleAbortMessage(conn)
     # 设备长时间空闲检测，用于say goodbye
     await no_voice_close_connect(conn, have_voice)
     # 接收音频
@@ -75,10 +91,14 @@ async def startToChat(conn: "ConnectionHandler", text):
         ):
             await max_out_size(conn)
             return
-
-    # manual 模式下不打断正在播放的内容
+    # 如果上一轮TTS还未结束（client_is_speaking残留为True），只做服务端内部清理
+    # 不发 tts stop 到客户端——因为客户端此时已进入新一轮对话，不需要收到上一轮的stop
+    # 修复：避免 handleAbortMessage 发送 tts stop 导致客户端误判为"AI回复完毕"直接进Idle
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
-        await handleAbortMessage(conn)
+        conn.logger.bind(tag=TAG).info("startToChat: client_is_speaking=True, silent abort (no tts stop to client)")
+        conn.client_abort = True
+        conn.clear_queues()
+        conn.clearSpeakStatus()
 
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
@@ -89,10 +109,6 @@ async def startToChat(conn: "ConnectionHandler", text):
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
-
-    # 准备开始新会话
-    conn.client_abort = False
-
     conn.executor.submit(conn.chat, actual_text)
 
 

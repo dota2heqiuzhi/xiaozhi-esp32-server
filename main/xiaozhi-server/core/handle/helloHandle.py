@@ -20,15 +20,11 @@ TAG = __name__
 WAKEUP_CONFIG = {
     "refresh_time": 10,
     "responses": [
-        "我一直都在呢，您请说。",
-        "在的呢，请随时吩咐我。",
-        "来啦来啦，请告诉我吧。",
-        "您请说，我正听着。",
-        "请您讲话，我准备好了。",
-        "请您说出指令吧。",
-        "我认真听着呢，请讲。",
-        "请问您需要什么帮助？",
-        "我在这里，等候您的指令。",
+        "来啦来啦，什么事呀？",
+        "我在呢，你说！",
+        "嗨，找我有什么好玩的事吗？",
+        "来啦！你想聊点什么呀？",
+        "我在听呢，说吧说吧！",
     ],
 }
 
@@ -41,6 +37,16 @@ _wakeup_response_lock = asyncio.Lock()
 
 async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
     """处理hello消息"""
+    # 每次新连接（hello）时，重置角色为默认小智
+    # 因为新连接的 prompt 总是从数据库加载的默认角色，
+    # 必须让 _current_role 与之同步，否则双击 toggle 方向会反
+    try:
+        import plugins_func.functions.change_role as cr_module
+        cr_module._current_role = "默认小智"
+        conn.logger.bind(tag=TAG).debug("已重置角色状态为默认小智")
+    except Exception:
+        pass
+
     audio_params = msg_json.get("audio_params")
     if audio_params:
         format = audio_params.get("format")

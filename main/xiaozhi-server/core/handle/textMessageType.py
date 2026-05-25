@@ -10,3 +10,4 @@ class TextMessageType(Enum):
     MCP = "mcp"
     SERVER = "server"
     PING = "ping"
+    ROLE_SWITCH = "role_switch"
