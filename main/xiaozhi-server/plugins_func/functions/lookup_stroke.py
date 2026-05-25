@@ -41,8 +41,9 @@ TAG = __name__
 logger = setup_logging()
 
 # === 配置 ===
-# 内网直连，音箱和 PVE 在同一局域网
-IMG_BASE_URL = "http://192.168.1.170:8090/strokes"
+# 笔顺图片公网入口。gzcvm NPM stream: 175.178.247.160:18090 → 192.168.1.170:8090
+# 这样设备在大陆外网也能下载；香港家里后续可用 OpenWrt/Lucky 劫持 175.178.247.160:18090 到内网。
+IMG_BASE_URL = "http://175.178.247.160:18090/strokes"
 
 # 图片格式：优先 GIF（动画笔顺），fallback PNG（静态）
 # 设备固件 SetPreviewImage 已支持 GIF 检测和 LvglGif 播放
