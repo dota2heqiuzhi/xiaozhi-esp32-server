@@ -11,3 +11,4 @@ class TextMessageType(Enum):
     SERVER = "server"
     PING = "ping"
     ROLE_SWITCH = "role_switch"
+    CLIENT_EVENT = "client_event"

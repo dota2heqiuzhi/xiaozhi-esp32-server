@@ -1,6 +1,7 @@
 from typing import Dict, Optional
 
 from core.handle.textHandler.abortMessageHandler import AbortTextMessageHandler
+from core.handle.textHandler.clientEventMessageHandler import ClientEventTextMessageHandler
 from core.handle.textHandler.helloMessageHandler import HelloTextMessageHandler
 from core.handle.textHandler.iotMessageHandler import IotTextMessageHandler
 from core.handle.textHandler.listenMessageHandler import ListenTextMessageHandler
@@ -31,6 +32,7 @@ class TextMessageHandlerRegistry:
             ServerTextMessageHandler(),
             PingMessageHandler(),
             RoleSwitchMessageHandler(),
+            ClientEventTextMessageHandler(),
         ]
 
         for handler in handlers:
