@@ -328,6 +328,14 @@ async def send_stt_message(conn: "ConnectionHandler", text):
     await send_tts_message(conn, "start")
     # 发送start消息后客户端状态会处于说话中状态，同步服务端状态
     conn.client_is_speaking = True
+    # 同步打上时间戳：receiveAudioHandle.handleAudioMessage 里有一段 1.5s 保护期逻辑
+    # `if speaking_start > 0 and (time.time() - speaking_start) < guard_sec`，
+    # 如果不在这里设置 client_is_speaking_ts，那个保护期永远不会生效——
+    # 默认值是 0，speaking_start > 0 永远 False，每次 send_stt_message 后只要 VAD
+    # 检测到用户还在说话尾音/呼吸/噪声，就会立刻 handleAbortMessage 打断 LLM。
+    # 这正是 2026-05-28 抓到的"AI 偶发不回复直接 idle"BUG 现场（详见
+    # firmware/docs/observability.md 中相关排查记录）。
+    conn.client_is_speaking_ts = time.time()
 
 
 async def send_display_message(conn: "ConnectionHandler", text):
