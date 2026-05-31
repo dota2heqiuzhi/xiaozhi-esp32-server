@@ -90,9 +90,10 @@ lookup_stroke_function_desc = {
     "function": {
         "name": "lookup_stroke",
         "description": (
-            "查询汉字写法并在屏幕上显示该字的图片。当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。\n"
+            "查询汉字写法并在屏幕上显示该字的图片，同时朗读一句包含这个字的常见古诗词，让孩子在学写字的同时学一句诗。\n"
+            "当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。\n"
             "\n"
-            "⚠️ 重要：调用前必须自动纠正 ASR（语音识别）错误。\n"
+            "⚠️ 重要 1：调用前必须自动纠正 ASR（语音识别）错误。\n"
             "孩子在儿童设备上用语音说话，ASR 经常把同音字识别错（最常见：把'龙'听成'笼'）。\n"
             "调用此工具前，按以下规则**自动纠正**，不要反问用户：\n"
             "\n"
@@ -110,7 +111,29 @@ lookup_stroke_function_desc = {
             "\n"
             "3) 如果问句没有「X的Y字」结构（例如'教我写龙字'、'龙字怎么写'、'写一个爱'），character 直接用用户说的字，context_phrase 留空。\n"
             "\n"
-            "4) 如果 Y 确实不在 X 中、但你找不到任何同音/近音字可以替代（极罕见），就保留原字（不要瞎改）。"
+            "4) 如果 Y 确实不在 X 中、但你找不到任何同音/近音字可以替代（极罕见），就保留原字（不要瞎改）。\n"
+            "\n"
+            "⚠️ 重要 2：必须同时给出 poem_line —— 一句包含此字的常见古诗词。\n"
+            "目的：让孩子在学写字的同时学一句古诗，扩展知识量。\n"
+            "\n"
+            "5) poem_line 选取规则：\n"
+            "   - **必须真实存在**（不要编造），优先小学/初中语文课本里的古诗（李白、杜甫、王之涣、王昌龄、孟浩然、白居易、苏轼、王维等耳熟能详作者）\n"
+            "   - **必须包含 character 这个字面字**（如果选不到包含该字的著名古诗，宁可留空也不要瞎选）\n"
+            "   - **长度 1-2 句**，10-20 个汉字最好（太长 TTS 朗读时间过长，孩子失去耐心）\n"
+            "   - 不要带书名号、作者、解释 —— 只要诗句本身\n"
+            "\n"
+            "6) poem_line 示例：\n"
+            "   - character='龙' → poem_line='但使龙城飞将在，不教胡马度阴山'\n"
+            "   - character='春' → poem_line='春眠不觉晓，处处闻啼鸟'\n"
+            "   - character='月' → poem_line='床前明月光，疑是地上霜'\n"
+            "   - character='雪' → poem_line='孤舟蓑笠翁，独钓寒江雪'\n"
+            "   - character='山' → poem_line='远看山有色，近听水无声'\n"
+            "   - character='风' → poem_line='夜来风雨声，花落知多少'\n"
+            "   - character='花' → poem_line='夜来风雨声，花落知多少'\n"
+            "   - character='鹅' → poem_line='鹅鹅鹅，曲项向天歌'\n"
+            "   - character='床' → poem_line='床前明月光，疑是地上霜'\n"
+            "\n"
+            "7) 如果 character 是冷僻字（极罕见，例如'璎'、'麈'），实在找不到包含此字的著名古诗，把 poem_line 设为空字符串。"
         ),
         "parameters": {
             "type": "object",
@@ -122,6 +145,10 @@ lookup_stroke_function_desc = {
                 "context_phrase": {
                     "type": "string",
                     "description": "（可选）用户说的上下文词组。例如用户说'龙马的龙字怎么写'，这里填'龙马'；用户说'龙字怎么写'，这里留空。",
+                },
+                "poem_line": {
+                    "type": "string",
+                    "description": "包含 character 的一句常见古诗词（1-2 句，10-20 字）。例：character='龙' → '但使龙城飞将在，不教胡马度阴山'。冷僻字找不到著名古诗时留空。",
                 },
             },
             "required": ["character"],
@@ -187,12 +214,13 @@ def _send_mcp_in_new_loop(conn, payload, timeout=15):
 
 
 @register_function("lookup_stroke", lookup_stroke_function_desc, ToolType.SYSTEM_CTL)
-def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = ""):
-    """查询汉字笔顺，在设备屏幕显示笔顺图片
+def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = "", poem_line: str = ""):
+    """查询汉字笔顺，在设备屏幕显示笔顺图片，并朗读一句包含此字的古诗
 
     参数：
-        character: 要查询的单个汉字（LLM 已经做过 ASR 同音字自动纠错）
+        character:      要查询的单个汉字（LLM 已经做过 ASR 同音字自动纠错）
         context_phrase: 用户说的上下文词组（用于日志观测纠错效果 + 优化 TTS 文案）
+        poem_line:      LLM 给的、包含此字的常见古诗词（用于 TTS 朗读，让孩子学一句诗）
     """
 
     # 0. 观测日志：直接打印 LLM 传过来的两个参数，方便 grep 看自动纠错效果
@@ -337,9 +365,30 @@ def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str
         # "X的Y字"，让用户能听清楚我们查的是哪个字（万一 LLM 自动纠错错了，
         # 用户能立刻发现）。否则 fallback 到精简版"这是X字"。
         if context_phrase and character in context_phrase:
-            tts_text = f"这是{context_phrase}的{character}字！"
+            intro_text = f"这是{context_phrase}的{character}字。"
         else:
-            tts_text = f"这是{char}字！"
+            intro_text = f"这是{char}字。"
+
+        # 古诗词校验：LLM 给的 poem_line 必须真的包含这个字（防 LLM 跑题/幻觉）
+        # 同时字符也要纳入繁简两种形式都允许
+        poem_text = ""
+        if poem_line:
+            poem_clean = poem_line.strip().rstrip("。！？.!?")
+            if char in poem_clean or display_char in poem_clean:
+                poem_text = poem_clean + "。"
+                logger.bind(tag=TAG).info(
+                    f"[POEM-OK] character={char}, poem='{poem_clean}'"
+                )
+            else:
+                logger.bind(tag=TAG).warning(
+                    f"[POEM-DROPPED] poem_line='{poem_clean}' 不含字'{char}'/'{display_char}'，"
+                    f"丢弃（防 LLM 跑题）"
+                )
+        else:
+            logger.bind(tag=TAG).info(f"[POEM-EMPTY] LLM 未给 poem_line（character={char}）")
+
+        # 最终 TTS：intro + 可选的诗句
+        tts_text = intro_text + poem_text
 
         return ActionResponse(
             action=Action.RESPONSE,
