@@ -89,14 +89,40 @@ lookup_stroke_function_desc = {
     "type": "function",
     "function": {
         "name": "lookup_stroke",
-        "description": "查询汉字写法并在屏幕上显示该字的图片。当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。",
+        "description": (
+            "查询汉字写法并在屏幕上显示该字的图片。当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。\n"
+            "\n"
+            "⚠️ 重要：调用前必须自动纠正 ASR（语音识别）错误。\n"
+            "孩子在儿童设备上用语音说话，ASR 经常把同音字识别错（最常见：把'龙'听成'笼'）。\n"
+            "调用此工具前，按以下规则**自动纠正**，不要反问用户：\n"
+            "\n"
+            "1) 如果用户问句符合「X的Y字（怎么写）」结构（X 是组词/上下文词组，Y 是要查的字）：\n"
+            "   - 检查 Y 是否真的是 X 中的某个字。\n"
+            "   - 如果 Y 不在 X 中，则 Y 极有可能是 ASR 把 X 中某个字误听成的同音字（或近音字）。\n"
+            "   - 此时把 character 自动设为 X 中那个发音相同（或相近）的字。\n"
+            "\n"
+            "2) 自动纠错示例（请按这种方式处理）：\n"
+            "   - '龙马的笼字怎么写' → '笼'(lóng) 不在'龙马'中，与'龙'(lóng)同音 → character='龙', context_phrase='龙马'\n"
+            "   - '妈妈的吗字怎么写' → '吗'(ma) 不在'妈妈'中，与'妈'(mā)同音 → character='妈', context_phrase='妈妈'\n"
+            "   - '太阳的羊字怎么写' → '羊'(yáng) 不在'太阳'中，与'阳'(yáng)同音 → character='阳', context_phrase='太阳'\n"
+            "   - '大家的家字怎么写' → '家' 已经在'大家'中 → character='家', context_phrase='大家'（无需纠正）\n"
+            "   - '龙字怎么写' → 没有上下文词组 → character='龙', context_phrase 留空\n"
+            "\n"
+            "3) 如果问句没有「X的Y字」结构（例如'教我写龙字'、'龙字怎么写'、'写一个爱'），character 直接用用户说的字，context_phrase 留空。\n"
+            "\n"
+            "4) 如果 Y 确实不在 X 中、但你找不到任何同音/近音字可以替代（极罕见），就保留原字（不要瞎改）。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "character": {
                     "type": "string",
-                    "description": "要查询笔顺的单个汉字，例如：龍、人、愛",
-                }
+                    "description": "要查询笔顺的单个汉字（已经过你自动纠错的最终字）。例如：龍、人、愛。",
+                },
+                "context_phrase": {
+                    "type": "string",
+                    "description": "（可选）用户说的上下文词组。例如用户说'龙马的龙字怎么写'，这里填'龙马'；用户说'龙字怎么写'，这里留空。",
+                },
             },
             "required": ["character"],
         },
@@ -161,8 +187,28 @@ def _send_mcp_in_new_loop(conn, payload, timeout=15):
 
 
 @register_function("lookup_stroke", lookup_stroke_function_desc, ToolType.SYSTEM_CTL)
-def lookup_stroke(conn: "ConnectionHandler", character: str):
-    """查询汉字笔顺，在设备屏幕显示笔顺图片"""
+def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = ""):
+    """查询汉字笔顺，在设备屏幕显示笔顺图片
+
+    参数：
+        character: 要查询的单个汉字（LLM 已经做过 ASR 同音字自动纠错）
+        context_phrase: 用户说的上下文词组（用于日志观测纠错效果 + 优化 TTS 文案）
+    """
+
+    # 0. 观测日志：直接打印 LLM 传过来的两个参数，方便 grep 看自动纠错效果
+    #    （如果用户说"龙马的笼字"，LLM 应输出 character="龙", context_phrase="龙马"）
+    if context_phrase:
+        if character in context_phrase:
+            logger.bind(tag=TAG).info(
+                f"[ASR-OK] character={character} 在上下文'{context_phrase}'中"
+            )
+        else:
+            logger.bind(tag=TAG).warning(
+                f"[ASR-FIX-FAILED?] character={character} 不在上下文'{context_phrase}'中 "
+                f"（LLM 可能没找到合适的同音字替代，按原字处理）"
+            )
+    else:
+        logger.bind(tag=TAG).info(f"[ASR-NO-CTX] character={character}（无上下文）")
 
     # 1. 参数校验
     if not character or len(character.strip()) == 0:
@@ -287,8 +333,13 @@ def lookup_stroke(conn: "ConnectionHandler", character: str):
         logger.bind(tag=TAG).info(f"MCP 发送成功: {img_url}")
 
         # 构造语音回复（尽量精简，减少 TTS 和 GIF 同时播放的 CPU 压力）
-        # 后续优化 GIF 解码效率后，再加回字的解释、笔画数等丰富内容
-        tts_text = f"这是{char}字！"
+        # 当 LLM 提供了 context_phrase 且 character 是 X 中的字时，TTS 朗读
+        # "X的Y字"，让用户能听清楚我们查的是哪个字（万一 LLM 自动纠错错了，
+        # 用户能立刻发现）。否则 fallback 到精简版"这是X字"。
+        if context_phrase and character in context_phrase:
+            tts_text = f"这是{context_phrase}的{character}字！"
+        else:
+            tts_text = f"这是{char}字！"
 
         return ActionResponse(
             action=Action.RESPONSE,
