@@ -168,11 +168,12 @@ class UnifiedToolHandler:
 
             self.logger.debug(f"调用函数: {function_name}, 参数: {arguments}")
 
-            # 发送工具调用显示消息到设备
-            try:
-                await send_display_message(self.conn, f"% {function_name}")
-            except Exception as e:
-                self.logger.warning(f"发送工具调用显示消息失败: {e}")
+            # 🔧 boilon-v2 customization: skip the upstream "% {function_name}" display
+            # message. The original line was:
+            #   await send_display_message(self.conn, f"% {function_name}")
+            # which made "% lookup_stroke" appear on the kid's screen via stt
+            # message. We don't want any tool-name visualization on kid devices.
+            # If you ever need it back, restore the 5 lines from upstream history.
 
             # 执行工具调用
             result = await self.tool_manager.execute_tool(function_name, arguments)
