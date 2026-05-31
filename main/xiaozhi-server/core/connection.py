@@ -993,6 +993,22 @@ class ConnectionHandler:
         # 支持多个并行工具调用 - 使用列表存储
         tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
         content_arguments = ""
+        # 🔧 function-call 模式下，缓冲 LLM 的 pre-tool-call content。
+        # 原因：OpenAI 协议下 LLM 经常在 tool_calls delta 之前先吐若干 content delta
+        # （比如"我这就帮你查查..."），如果立刻送进 TTS 会导致：
+        #   - 用户在工具结果之前先听到一句无意义的口水话
+        #   - 这句话还会通过 sentence_start 推给固件 -> 屏幕上闪现"查询中"等文本
+        # 缓冲策略：流结束后再决定。
+        #   - 如果整个流期间 tool_call_flag 始终为 False（LLM 没调工具，是普通回答）
+        #     → flush 整个 buffer 到 TTS（普通对话兜底，不会丢话）
+        #   - 如果 tool_call_flag 转为 True 之前的 content 已经在 buffer 中
+        #     → 在 tool_call_flag 转 True 时立刻清 buffer（丢弃口水话）
+        # 副作用：function-call 模式下、且 LLM 实际不调工具时，TTS 会延迟到流结束才开始
+        # （延迟约 200-500ms）。这对儿童设备的体验是可接受的代价。
+        content_buffer = []
+        in_function_call_mode = (
+            self.intent_type == "function_call" and functions is not None
+        )
         self.client_abort = False
         emotion_flag = True
         try:
@@ -1026,7 +1042,17 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
-                    if not tool_call_flag:
+                    if tool_call_flag:
+                        # 已确认是工具调用：丢弃所有缓冲的 pre-tool-call content
+                        # （这通常是 LLM 调工具前的口水话，比如"我这就帮你查查..."）
+                        if content_buffer:
+                            content_buffer.clear()
+                        # 当前 content 也不送 TTS（多半是 tool_calls JSON 的尾巴）
+                    elif in_function_call_mode:
+                        # function-call 模式但还没确定调不调工具 → 暂存到 buffer
+                        content_buffer.append(content)
+                    else:
+                        # 非 function-call 模式：原有行为，立即送 TTS
                         response_message.append(content)
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
@@ -1036,6 +1062,20 @@ class ConnectionHandler:
                                 content_detail=content,
                             )
                         )
+            # 🔧 流结束后：function-call 模式但最终没工具调用 → flush buffer 到 TTS
+            # 这种情况发生在 LLM 判断不需要调工具、直接给出文字回答时（普通对话）
+            if in_function_call_mode and not tool_call_flag and content_buffer:
+                final_text = "".join(content_buffer)
+                response_message.append(final_text)
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=self.sentence_id,
+                        sentence_type=SentenceType.MIDDLE,
+                        content_type=ContentType.TEXT,
+                        content_detail=final_text,
+                    )
+                )
+                content_buffer.clear()
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(

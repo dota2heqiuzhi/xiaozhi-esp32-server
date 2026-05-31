@@ -113,24 +113,32 @@ lookup_stroke_function_desc = {
             "\n"
             "4) 如果 Y 确实不在 X 中、但你找不到任何同音/近音字可以替代（极罕见），就保留原字（不要瞎改）。\n"
             "\n"
-            "⚠️ 重要 2：必须同时给出 poem_line —— 一句包含此字的常见古诗词。\n"
+            "⚠️ 重要 2：必须同时给出 poem_line —— 两句包含此字的常见古诗词。\n"
             "目的：让孩子在学写字的同时学一句古诗，扩展知识量。\n"
             "\n"
             "5) poem_line 选取规则：\n"
             "   - **必须真实存在**（不要编造），优先小学/初中语文课本里的古诗（李白、杜甫、王之涣、王昌龄、孟浩然、白居易、苏轼、王维等耳熟能详作者）\n"
             "   - **必须包含 character 这个字面字**（如果选不到包含该字的著名古诗，宁可留空也不要瞎选）\n"
-            "   - **长度 1-2 句**，10-20 个汉字最好（太长 TTS 朗读时间过长，孩子失去耐心）\n"
-            "   - 不要带书名号、作者、解释 —— 只要诗句本身\n"
+            "   - **必须 2 句一对**（古诗里相邻的两句，通常 12-20 个汉字），不要只给 1 句（孩子听不出韵律和意境，效果差很多）\n"
+            "   - **多样性要求**：同一个字每次回答尽量给不同的诗句，让孩子每次学到新东西。例如 character='月' 可在以下 5+ 选项里轮换：\n"
+            "       · '床前明月光，疑是地上霜'（李白·静夜思）\n"
+            "       · '举头望明月，低头思故乡'（李白·静夜思 后两句）\n"
+            "       · '海上生明月，天涯共此时'（张九龄·望月怀远）\n"
+            "       · '明月几时有，把酒问青天'（苏轼·水调歌头）\n"
+            "       · '月落乌啼霜满天，江枫渔火对愁眠'（张继·枫桥夜泊）\n"
+            "       · '小时不识月，呼作白玉盘'（李白·古朗月行）\n"
+            "     根据上下文随机选其中之一，不要每次都给同一句。\n"
+            "   - 不要带书名号、作者名、解释 —— 只要诗句本身\n"
             "\n"
-            "6) poem_line 示例：\n"
+            "6) poem_line 示例（注意都是 2 句一对）：\n"
             "   - character='龙' → poem_line='但使龙城飞将在，不教胡马度阴山'\n"
-            "   - character='春' → poem_line='春眠不觉晓，处处闻啼鸟'\n"
-            "   - character='月' → poem_line='床前明月光，疑是地上霜'\n"
-            "   - character='雪' → poem_line='孤舟蓑笠翁，独钓寒江雪'\n"
-            "   - character='山' → poem_line='远看山有色，近听水无声'\n"
-            "   - character='风' → poem_line='夜来风雨声，花落知多少'\n"
+            "   - character='春' → poem_line='春眠不觉晓，处处闻啼鸟' 或 '春风又绿江南岸，明月何时照我还'\n"
+            "   - character='月' → poem_line='床前明月光，疑是地上霜' 或 '海上生明月，天涯共此时'（每次轮换）\n"
+            "   - character='雪' → poem_line='孤舟蓑笠翁，独钓寒江雪' 或 '千山鸟飞绝，万径人踪灭'\n"
+            "   - character='山' → poem_line='远看山有色，近听水无声' 或 '不识庐山真面目，只缘身在此山中'\n"
+            "   - character='风' → poem_line='夜来风雨声，花落知多少' 或 '春风又绿江南岸，明月何时照我还'\n"
             "   - character='花' → poem_line='夜来风雨声，花落知多少'\n"
-            "   - character='鹅' → poem_line='鹅鹅鹅，曲项向天歌'\n"
+            "   - character='鹅' → poem_line='鹅鹅鹅，曲项向天歌'（这首本身只有 3 字一句，可破例给 2 行 6 字）\n"
             "   - character='床' → poem_line='床前明月光，疑是地上霜'\n"
             "\n"
             "7) 如果 character 是冷僻字（极罕见，例如'璎'、'麈'），实在找不到包含此字的著名古诗，把 poem_line 设为空字符串。"
@@ -148,7 +156,7 @@ lookup_stroke_function_desc = {
                 },
                 "poem_line": {
                     "type": "string",
-                    "description": "包含 character 的一句常见古诗词（1-2 句，10-20 字）。例：character='龙' → '但使龙城飞将在，不教胡马度阴山'。冷僻字找不到著名古诗时留空。",
+                    "description": "包含 character 的**两句**常见古诗词（必须 2 句一对，12-20 字）。例：character='龙' → '但使龙城飞将在，不教胡马度阴山'。冷僻字找不到著名古诗时留空。同一字每次尽量换不同诗句让孩子学到新内容。",
                 },
             },
             "required": ["character"],
@@ -371,14 +379,27 @@ def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str
 
         # 古诗词校验：LLM 给的 poem_line 必须真的包含这个字（防 LLM 跑题/幻觉）
         # 同时字符也要纳入繁简两种形式都允许
+        # 还要校验"至少 2 句"（一句的诗朗读出来意境/韵律不完整，对孩子学习效果差）
         poem_text = ""
         if poem_line:
             poem_clean = poem_line.strip().rstrip("。！？.!?")
+            # 数中文逗号/分号/句号判断有几个分句（古诗一般用，分隔上下句）
+            sep_count = sum(1 for ch in poem_clean if ch in "，,；;")
+            char_count = sum(1 for ch in poem_clean if '\u4e00' <= ch <= '\u9fff')
+
             if char in poem_clean or display_char in poem_clean:
-                poem_text = poem_clean + "。"
-                logger.bind(tag=TAG).info(
-                    f"[POEM-OK] character={char}, poem='{poem_clean}'"
-                )
+                if sep_count >= 1 and char_count >= 8:
+                    # 至少 1 个分隔符（=2 句）+ 至少 8 个汉字 = 算合格
+                    poem_text = poem_clean + "。"
+                    logger.bind(tag=TAG).info(
+                        f"[POEM-OK] character={char}, poem='{poem_clean}' "
+                        f"(sep={sep_count}, chars={char_count})"
+                    )
+                else:
+                    logger.bind(tag=TAG).warning(
+                        f"[POEM-TOO-SHORT] poem_line='{poem_clean}' 太短 "
+                        f"(sep={sep_count}, chars={char_count})，丢弃（要求至少 2 句）"
+                    )
             else:
                 logger.bind(tag=TAG).warning(
                     f"[POEM-DROPPED] poem_line='{poem_clean}' 不含字'{char}'/'{display_char}'，"
