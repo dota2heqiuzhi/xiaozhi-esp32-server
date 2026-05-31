@@ -149,6 +149,11 @@ tmp
 .history
 .DS_Store
 main/xiaozhi-server/data
+# 但古诗库相关文件必须纳入 git（boilon-v2 笔顺查询本地诗库）
+# 详见 firmware/docs/poem-database.md
+!main/xiaozhi-server/data/poems_curated.json
+!main/xiaozhi-server/data/poem_index.json
+!main/xiaozhi-server/data/README.md
 main/xiaozhi-server/.claude
 
 main/manager-web/node_modules

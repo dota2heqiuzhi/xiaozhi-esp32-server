@@ -32,6 +32,8 @@ from config.logger import setup_logging
 from typing import TYPE_CHECKING
 import asyncio
 import json
+import os
+import random
 import threading
 
 if TYPE_CHECKING:
@@ -67,6 +69,51 @@ TEST_INTERVAL = 5
 # MCP 工具名（设备端注册的名字，带点号）
 MCP_ORIGINAL_NAME = "self.screen.preview_image"
 
+# === 古诗倒排索引 ===
+# 启动时一次性载入 data/poem_index.json 到模块级 dict，O(1) 查询。
+# 索引由 scripts/build_poem_index.py 从 data/poems_curated.json 生成，
+# 完整设计文档见 firmware/docs/poem-database.md。
+#
+# 设计动机：早期让 LLM 直接出 poem_line 字段，反复出现"主题联想错位"
+# （如 character='病' LLM 给"巴山夜雨"——主题相关但字面没"病"），且 LLM
+# 流式生成 12-20 字诗导致 tool_calls 完整化耗时 3-5 秒。改成本地查表后：
+# 1) 100% 字面包含；2) LLM tool_calls JSON 短了，整体起播延迟 -2~4 秒。
+_POEM_INDEX_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'poem_index.json')
+)
+POEM_INDEX = {}
+try:
+    with open(_POEM_INDEX_PATH, encoding='utf-8') as _f:
+        POEM_INDEX = json.load(_f)
+    logger.bind(tag=TAG).info(
+        f"[poem-index] 载入成功: {len(POEM_INDEX)} 个汉字, "
+        f"{sum(len(v) for v in POEM_INDEX.values())} (字→诗) 对, "
+        f"path={_POEM_INDEX_PATH}"
+    )
+except FileNotFoundError:
+    logger.bind(tag=TAG).warning(
+        f"[poem-index] 索引文件不存在 ({_POEM_INDEX_PATH})。"
+        f"请运行 scripts/build_poem_index.py 生成。"
+        f"功能降级：只播'这是X字。'，不带古诗。"
+    )
+except Exception as e:
+    logger.bind(tag=TAG).error(
+        f"[poem-index] 加载失败 ({type(e).__name__}: {e})，降级到无诗模式"
+    )
+
+
+def _pick_poem(char: str, display_char: str = "") -> str:
+    """
+    从倒排索引随机抽一句包含该字的诗。
+    char 优先用简体字查（数据集都是简体）；display_char 是繁体兜底。
+    无匹配返回空字符串。
+    """
+    candidates = POEM_INDEX.get(char) or (POEM_INDEX.get(display_char) if display_char else None)
+    if not candidates:
+        return ""
+    return random.choice(candidates)
+
+
 # === 简体→繁体转换 ===
 # 只包含简繁写法不同的常用字对照
 # 格式：简体字 → 繁体字（一一对应）
@@ -85,15 +132,22 @@ def _simp_to_trad(char: str) -> str:
 
 
 # Function calling 描述
+#
+# 注意：本工具不再让 LLM 出诗。LLM 只需做两件事：
+# 1) 识别"用户想查某字怎么写"的意图（function calling 触发）
+# 2) 出正确的字（含 ASR 同音字纠错）
+#
+# 古诗朗读由服务端从本地索引（data/poem_index.json）随机抽取，
+# 详见 firmware/docs/poem-database.md。
 lookup_stroke_function_desc = {
     "type": "function",
     "function": {
         "name": "lookup_stroke",
         "description": (
-            "查询汉字写法，在屏幕显示该字的图片，并朗读一句包含此字的常见古诗。\n"
+            "查询汉字写法，在屏幕显示该字的图片，并自动配一句古诗朗读。\n"
             "当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。\n"
             "\n"
-            "═══ 一、调用前 ASR 自检（必做）═══\n"
+            "═══ 调用前 ASR 自检（必做）═══\n"
             "\n"
             "孩子用语音说话，ASR 经常把同音字认错。判断逻辑：\n"
             "\n"
@@ -110,61 +164,18 @@ lookup_stroke_function_desc = {
             "2) 用户问句没有「X的Y字」结构（例如「龙字怎么写」「教我写爱字」），\n"
             "   context_phrase 留空，character 直接用用户说的字。\n"
             "\n"
-            "3) 找不到任何同音字替换 → context_phrase 留空，character 保留原字。\n"
-            "\n"
-            "═══ 二、古诗词选诗规则（poem_line 参数）═══\n"
-            "\n"
-            "⚠️ 最关键规则：**诗里必须真的有 character 这个字面字**\n"
-            "\n"
-            "服务端会做字面校验。「主题相关」「含义相关」**都不算** — 必须**字面**包含此字。\n"
-            "这是最容易出错的地方。下面三组对照，仔细看：\n"
-            "\n"
-            "❌ character='友' → '桃花潭水深千尺，不及汪伦送我情'\n"
-            "   （这首诗主题是送朋友，但字面**没有'友'字** — 选了会被服务端丢弃，孩子听不到诗）\n"
-            "✓ character='友' → '洛阳亲友如相问，一片冰心在玉壶'（王昌龄，字面含'友'）\n"
-            "\n"
-            "❌ character='孙' → '儿童相见不相识，笑问客从何处来'\n"
-            "   （贺知章《回乡偶书》主题是孙辈不识祖父，但字面**没有'孙'字**）\n"
-            "✓ character='孙' → '春草明年绿，王孙归不归'（王维，字面含'孙'）\n"
-            "\n"
-            "❌ character='春' → '夜来风雨声，花落知多少'\n"
-            "   （描写春天景象，但字面**没有'春'字**）\n"
-            "✓ character='春' → '春眠不觉晓，处处闻啼鸟'（孟浩然，字面含'春'）\n"
-            "\n"
-            "其他规则：\n"
-            "- 必须 2 句一对（12-20 字），不要只给 1 句\n"
-            "- 优先大众耳熟能详的（小学课本类）；找不到简单的，给冷门一点的也 OK\n"
-            "- 同一个字每次轮换不同诗，让孩子每次学到新东西\n"
-            "- 实在找不到任何字面包含此字的诗，传空字符串\n"
-            "\n"
-            "多样性示例 — character='月' 可在以下轮换：\n"
-            "  · '床前明月光，疑是地上霜'（李白）\n"
-            "  · '海上生明月，天涯共此时'（张九龄）\n"
-            "  · '明月几时有，把酒问青天'（苏轼）\n"
-            "  · '月落乌啼霜满天，江枫渔火对愁眠'（张继）\n"
-            "\n"
-            "═══ 三、完整调用示例 ═══\n"
-            "\n"
-            "- '龙马的笼字怎么写' → character='龙', context_phrase='龙马', poem_line='但使龙城飞将在，不教胡马度阴山'\n"
-            "- '小朋友的有字怎么写' → character='友', context_phrase='小朋友', poem_line='洛阳亲友如相问，一片冰心在玉壶'\n"
-            "- '小鸟的鸟字怎么写' → character='鸟', context_phrase='小鸟', poem_line='月出惊山鸟，时鸣春涧中'\n"
-            "- '春天的春字怎么写' → character='春', context_phrase='春天', poem_line='春眠不觉晓，处处闻啼鸟'\n"
-            "- '龙字怎么写' → character='龙', context_phrase='', poem_line='但使龙城飞将在，不教胡马度阴山'"
+            "3) 找不到任何同音字替换 → context_phrase 留空，character 保留原字。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "character": {
                     "type": "string",
-                    "description": "要查询笔顺的单个汉字。**必须**是 context_phrase 中真实存在的某个字（如不存在请按一节做 ASR 同音字纠错替换）。例：龍、人、愛。",
+                    "description": "要查询笔顺的单个汉字。**必须**是 context_phrase 中真实存在的某个字（如不存在请按上面规则做 ASR 同音字纠错替换）。例：龙、人、爱。",
                 },
                 "context_phrase": {
                     "type": "string",
                     "description": "（可选）用户说的上下文词组。例如'龙马的龙字怎么写' → '龙马'。⚠️ 填之前必须验证 character 真的在这里面，否则就留空。",
-                },
-                "poem_line": {
-                    "type": "string",
-                    "description": "**两句**字面包含 character 的古诗（12-20 字）。⚠️ 必须是字面包含，不是主题相关。同一字每次轮换不同诗。实在找不到字面包含此字的诗才传空字符串。",
                 },
             },
             "required": ["character"],
@@ -230,13 +241,14 @@ def _send_mcp_in_new_loop(conn, payload, timeout=15):
 
 
 @register_function("lookup_stroke", lookup_stroke_function_desc, ToolType.SYSTEM_CTL)
-def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = "", poem_line: str = ""):
+def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = ""):
     """查询汉字笔顺，在设备屏幕显示笔顺图片，并朗读一句包含此字的古诗
 
     参数：
         character:      要查询的单个汉字（LLM 已经做过 ASR 同音字自动纠错）
-        context_phrase: 用户说的上下文词组（用于日志观测纠错效果 + 优化 TTS 文案）
-        poem_line:      LLM 给的、包含此字的常见古诗词（用于 TTS 朗读，让孩子学一句诗）
+        context_phrase: 用户说的上下文词组（用于日志观测纠错效果，不参与 TTS）
+
+    古诗由服务端从本地索引（POEM_INDEX）随机抽取，LLM 不再参与选诗。
     """
 
     # 0. 观测日志：直接打印 LLM 传过来的两个参数，方便 grep 看自动纠错效果
@@ -373,36 +385,16 @@ def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str
         # 让 LLM 做 ASR 自检 + 服务端日志观测，不参与 TTS）。
         intro_text = f"这是{char}字。"
 
-        # 古诗词校验：LLM 给的 poem_line 必须真的包含这个字（防 LLM 跑题/幻觉）
-        # 同时字符也要纳入繁简两种形式都允许
-        # 还要校验"至少 2 句"（一句的诗朗读出来意境/韵律不完整，对孩子学习效果差）
-        poem_text = ""
-        if poem_line:
-            poem_clean = poem_line.strip().rstrip("。！？.!?")
-            # 数中文逗号/分号/句号判断有几个分句（古诗一般用，分隔上下句）
-            sep_count = sum(1 for ch in poem_clean if ch in "，,；;")
-            char_count = sum(1 for ch in poem_clean if '\u4e00' <= ch <= '\u9fff')
-
-            if char in poem_clean or display_char in poem_clean:
-                if sep_count >= 1 and char_count >= 8:
-                    # 至少 1 个分隔符（=2 句）+ 至少 8 个汉字 = 算合格
-                    poem_text = poem_clean + "。"
-                    logger.bind(tag=TAG).info(
-                        f"[POEM-OK] character={char}, poem='{poem_clean}' "
-                        f"(sep={sep_count}, chars={char_count})"
-                    )
-                else:
-                    logger.bind(tag=TAG).warning(
-                        f"[POEM-TOO-SHORT] poem_line='{poem_clean}' 太短 "
-                        f"(sep={sep_count}, chars={char_count})，丢弃（要求至少 2 句）"
-                    )
-            else:
-                logger.bind(tag=TAG).warning(
-                    f"[POEM-DROPPED] poem_line='{poem_clean}' 不含字'{char}'/'{display_char}'，"
-                    f"丢弃（防 LLM 跑题）"
-                )
+        # 古诗：本地索引随机抽（character 是简体，display_char 是繁体兜底）
+        poem_clean = _pick_poem(char, display_char)
+        if poem_clean:
+            poem_text = poem_clean + "。"
+            logger.bind(tag=TAG).info(f"[POEM-OK] character={char}, poem='{poem_clean}'")
         else:
-            logger.bind(tag=TAG).info(f"[POEM-EMPTY] LLM 未给 poem_line（character={char}）")
+            poem_text = ""
+            logger.bind(tag=TAG).info(
+                f"[POEM-EMPTY] 索引中没有含字'{char}'的诗 — fallback 到精简 TTS"
+            )
 
         # 最终 TTS：intro + 可选的诗句
         tts_text = intro_text + poem_text
