@@ -338,22 +338,14 @@ def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str
         )
 
     # === 正常模式 ===
-    # 确定图片 URL（GIF 优先，fallback PNG）
-    img_url = f"{IMG_BASE_URL}/{hex_str}.{IMG_FORMAT}"  # 默认 PNG
-    used_format = IMG_FORMAT
-    
-    if GIF_ENABLED:
-        gif_url = f"{IMG_BASE_URL}/{hex_str}.gif"
-        try:
-            import urllib.request
-            req = urllib.request.Request(gif_url, method="HEAD")
-            resp = urllib.request.urlopen(req, timeout=2)
-            if resp.status == 200:
-                img_url = gif_url
-                used_format = "gif"
-                logger.bind(tag=TAG).info(f"GIF 可用，使用动画版: {gif_url}")
-        except Exception:
-            logger.bind(tag=TAG).info(f"GIF 不可用，fallback 到 PNG")
+    # 直接默认 GIF。strokes 数据集已确认完整覆盖（GIF 9575 个 + PNG 9574 个，
+    # 一字一对配对），常用汉字必有 GIF。
+    # 历史代码这里有 HEAD 请求验证 GIF 是否存在（早期数据集只有 PNG 时的兜底），
+    # 现在已无必要 — 每次 HEAD 请求耗时 100ms-2s，对儿童设备体验影响明显。
+    # 万一极冷僻字真没 GIF，固件下载 404 → 屏幕空白几秒 → preview_timer 60s
+    # 自动恢复 emoji，体验上可接受。
+    img_url = f"{IMG_BASE_URL}/{hex_str}.gif"
+    used_format = "gif"
     
     logger.bind(tag=TAG).info(
         f"笔顺查询: {char}"
