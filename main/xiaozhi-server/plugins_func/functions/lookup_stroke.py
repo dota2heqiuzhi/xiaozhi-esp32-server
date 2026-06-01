@@ -43,8 +43,24 @@ TAG = __name__
 logger = setup_logging()
 
 # === 配置 ===
-# 笔顺图片公网入口。gzcvm NPM stream: 175.178.247.160:18090 → 192.168.1.170:8090
-# 这样设备在大陆外网也能下载；香港家里后续可用 OpenWrt/Lucky 劫持 175.178.247.160:18090 到内网。
+# 笔顺图片公网入口（gzcvm NPM stream: 175.178.247.160:18090 → 192.168.1.170:8090）。
+# 服务端只推这一个外网 URL，不区分设备所在网络位置 —— 设备所处网络的判断 + URL
+# 改写完全在固件端完成，服务端保持无状态。
+#
+# 固件端机制（详见 firmware/src/main/boards/boilon-v2/boilon_network_route.h）：
+#   1) 设备开机连 WiFi 后，如果本机 IP 以 "192.168.1." 开头，TCP 探测内网
+#      OTA 端口 192.168.1.170:18002（800ms 超时），结果缓存到下次重启。
+#   2) RewriteStrokeUrlForActiveNetwork() 在内网模式下把笔顺 GIF URL 中的
+#      "http://175.178.247.160:18090/strokes" 替换为
+#      "http://192.168.1.170:8090/strokes"（注意端口也不一样）。
+#   3) RewriteHostForActiveNetwork() 同样改写 OTA / WebSocket / 固件下载等 URL。
+#
+# 因此设备在两种网络下的行为：
+#   - 大陆外网（公网 NAT IP）   → 跳过探测 → 走 175.178.247.160:18090（NPM 转发）
+#   - 香港家里 192.168.1.x 内网 → 探测通 → 自动改写为 192.168.1.170:8090 直连
+#
+# 注意事项：
+#   - 探测结果用 static 缓存，外网→内网切换 WiFi 后需要重启设备才会重新探测。
 IMG_BASE_URL = "http://175.178.247.160:18090/strokes"
 
 # 图片格式：优先 GIF（动画笔顺），fallback PNG（静态）
