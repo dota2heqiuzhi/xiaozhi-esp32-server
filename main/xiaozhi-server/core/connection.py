@@ -860,6 +860,29 @@ class ConnectionHandler:
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
+            # ⭐ 关键修复：在推 FIRST 之前先重置 client_abort=False。
+            #
+            # 原因：startToChat() 检测到 client_is_speaking 残留时，会主动设置
+            # client_abort=True 来"silent abort"上一轮（详见 receiveAudioHandle.py
+            # line 97-101）。然后 startToChat 把 chat() 提交给 executor 跑。
+            #
+            # chat() 进来后立刻在这里推 FIRST 到 tts_text_queue。但由于 client_abort
+            # 还是 True，TTS 文本处理线程（base.py tts_text_priority_thread）从队列取
+            # 出 FIRST 后命中 `if self.conn.client_abort: continue` 分支 —— FIRST
+            # 被丢弃，留下日志"收到打断信息，终止TTS文本处理线程"。
+            #
+            # FIRST 被丢弃的连锁反应非常严重：FIRST handler 负责把 TTS 线程内部状态
+            # （current_sentence_id、tts_audio_first_sentence、tts_text_buff、
+            # is_first_sentence）重置成"新会话开始"。如果 FIRST 没被处理，这些状态
+            # 仍然停留在上一轮的"已结束"形态，导致后续 MIDDLE 音频虽然 TTS 合成成功
+            # （日志有"语音生成成功"），但 sendAudioHandle 不会作为新会话首段音频流
+            # 派发给设备 —— 设备只收到一个孤零零的 LAST 包，理解为"AI 立刻说完了"
+            # 直接回 Idle，用户什么也听不到。
+            #
+            # 修复：这里 reset client_abort=False 后再推 FIRST，TTS 线程会正常处理
+            # FIRST 并初始化新会话状态。注意原本在 line 1012 还有一处一样的赋值，
+            # 保留为防御性兜底（即使中间有什么改了它，LLM stream 启动前再确认一次）。
+            self.client_abort = False
             self.sentence_id = str(uuid.uuid4().hex)
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
