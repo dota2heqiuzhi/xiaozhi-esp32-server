@@ -870,6 +870,24 @@ class ConnectionHandler:
                 )
             )
 
+        # ⭐ 并发安全快照：记录本轮 chat() 的 sentence_id 局部副本。
+        #
+        # 背景：chat() 跑在 executor 线程里。当用户快速打断 + 立刻发起新一轮对话时，
+        # 新一轮 chat() 会进入这个函数并改写 self.sentence_id。如果旧 chat() 线程
+        # 仍在 LLM stream 中或在做 tool_call 处理，它继续读 self.sentence_id 时
+        # 会拿到新轮的 ID —— 把残留 chunk / LAST 信号挂上新轮的 ID 推进 TTS 队列，
+        # 篡改成"新一轮的回复"播给用户，且新一轮 chat 真正的输出反而被旧 LAST
+        # 终结掉，整轮对话静音失败。
+        #
+        # 修复策略：本函数内所有推 tts_text_queue / tool_call 处理路径，统一改用
+        # my_sentence_id（不变）；并在并发敏感点（for-loop / 流后 / tool_call 前）
+        # 检查 self.sentence_id != my_sentence_id，不一致就立刻 return，让"被取代的"
+        # 旧 chat 不再产生任何副作用。
+        #
+        # 正常路径（无并发）下 my_sentence_id == self.sentence_id，所有检查都是 no-op，
+        # 行为与原来完全一致。
+        my_sentence_id = self.sentence_id
+
         # 设置最大递归深度，避免无限循环，可根据实际需求调整
         MAX_DEPTH = 5
         force_final_answer = False  # 标记是否强制最终回答
@@ -1015,6 +1033,17 @@ class ConnectionHandler:
             for response in llm_responses:
                 if self.client_abort:
                     break
+                # ⭐ 检测到本轮 chat 已被新一轮取代 —— 立刻 return（跳过后续所有副作用）
+                # 之所以用 return 而不是 break：break 会进入下面的 tool_call 处理 +
+                # LAST 推送，而我们希望被取代的旧 chat 完全静默退出。
+                if self.sentence_id != my_sentence_id:
+                    self.logger.bind(tag=TAG).info(
+                        f"chat() depth={depth} 检测到 sentence_id 已被新一轮覆盖 "
+                        f"(my={my_sentence_id[:8] if my_sentence_id else 'None'}, "
+                        f"current={self.sentence_id[:8] if self.sentence_id else 'None'})"
+                        f"，提前退出，避免污染新一轮对话"
+                    )
+                    return
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
                     if "content" in response:
@@ -1056,7 +1085,7 @@ class ConnectionHandler:
                         response_message.append(content)
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
-                                sentence_id=self.sentence_id,
+                                sentence_id=my_sentence_id,
                                 sentence_type=SentenceType.MIDDLE,
                                 content_type=ContentType.TEXT,
                                 content_detail=content,
@@ -1069,7 +1098,7 @@ class ConnectionHandler:
                 response_message.append(final_text)
                 self.tts.tts_text_queue.put(
                     TTSMessageDTO(
-                        sentence_id=self.sentence_id,
+                        sentence_id=my_sentence_id,
                         sentence_type=SentenceType.MIDDLE,
                         content_type=ContentType.TEXT,
                         content_detail=final_text,
@@ -1080,7 +1109,7 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
-                    sentence_id=self.sentence_id,
+                    sentence_id=my_sentence_id,
                     sentence_type=SentenceType.MIDDLE,
                     content_type=ContentType.TEXT,
                     content_detail=get_system_error_response(self.config),
@@ -1089,11 +1118,21 @@ class ConnectionHandler:
             if depth == 0:
                 self.tts.tts_text_queue.put(
                     TTSMessageDTO(
-                        sentence_id=self.sentence_id,
+                        sentence_id=my_sentence_id,
                         sentence_type=SentenceType.LAST,
                         content_type=ContentType.ACTION,
                     )
                 )
+            return
+        # ⭐ 流处理结束后：再次检查是否已被新一轮 chat 取代。
+        # 必须在 tool_call 处理之前 —— 因为 tool_call 内部有副作用（如 lookup_stroke
+        # 通过 MCP 直接推图给设备屏幕、_handle_function_result 调 tts_one_sentence
+        # 推工具回复到 TTS 队列等）。被取代的旧 chat 不应该再触发这些副作用。
+        if self.sentence_id != my_sentence_id:
+            self.logger.bind(tag=TAG).info(
+                f"chat() depth={depth} 流结束后检测到 sentence_id 不匹配，"
+                f"跳过 tool_call 处理 / LAST 推送"
+            )
             return
         # 处理function call
         if tool_call_flag:
@@ -1169,6 +1208,16 @@ class ConnectionHandler:
 
                 # 统一处理所有工具调用结果
                 if tool_results:
+                    # ⭐ tool 阻塞执行（future.result()）期间可能跨越数秒，新一轮 chat
+                    # 完全可能已经启动并改写 self.sentence_id。在调用
+                    # _handle_function_result 之前再次校验：被取代的旧 chat 不应该
+                    # 把工具结果（如 "这是龙字。古诗。"）推进 TTS 队列污染新一轮回复。
+                    if self.sentence_id != my_sentence_id:
+                        self.logger.bind(tag=TAG).info(
+                            f"chat() depth={depth} tool 执行完成后检测到 sentence_id "
+                            f"不匹配，跳过 _handle_function_result"
+                        )
+                        return
                     self._handle_function_result(tool_results, depth=depth)
 
         # 存储对话内容
@@ -1184,7 +1233,7 @@ class ConnectionHandler:
         if depth == 0:
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
-                    sentence_id=self.sentence_id,
+                    sentence_id=my_sentence_id,
                     sentence_type=SentenceType.LAST,
                     content_type=ContentType.ACTION,
                 )
