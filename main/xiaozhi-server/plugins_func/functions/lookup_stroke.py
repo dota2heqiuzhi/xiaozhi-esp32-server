@@ -1,40 +1,23 @@
-"""
-笔顺查询插件 - 在博亿朗二代屏幕上显示汉字笔顺图片
+"""Display the stroke order for one character and optionally recite a poem."""
 
-调用链路：
-  孩子说"龍字怎么写"
-  → LLM function_call: lookup_stroke(character="龍")
-  → 本插件：ord("龍") → 0x9F8D → 图片 URL
-  → 直接发送 MCP tools/call("self.screen.preview_image", {url: ...})
-    （绕过 call_mcp_tool 的 has_tool 检查，因为 preview_image 是 user_only 工具）
-  → 设备从内网下载 PNG 图片 → 屏幕显示笔顺
-  → TTS 语音播报
-
-显示格式：
-  当前：PNG 静态图（每笔不同颜色 + 序号标注，完整字形）
-  未来：如果固件支持 GIF 显示，可切换为 GIF 动画模式（代码已预留）
-
-⚠️ 关键架构约束：
-  plugin_executor.py 的 execute() 方法虽然是 async def，但对 SYSTEM_CTL 类型插件
-  做的是同步调用：result = func_item.func(conn, **arguments)
-  这意味着 lookup_stroke() 运行在事件循环线程中，如果用 run_coroutine_threadsafe()
-  往同一个 conn.loop 提交协程再 .result() 阻塞等待 → 死锁！
-  解决方案：用新线程+新事件循环发送 WebSocket 消息，避免阻塞 conn.loop。
-
-⚠️ 图片持久显示：
-  自定义固件已将 PREVIEW_IMAGE_DURATION_MS 改为 120000（120秒）。
-  只需发送一次 preview_image，图片会持续显示 120 秒后自动恢复 Emoji。
-  不需要重发循环（重发会导致 GIF 数据 use-after-free 崩溃）。
-"""
-
-from plugins_func.register import register_function, ToolType, ActionResponse, Action
-from config.logger import setup_logging
-from typing import TYPE_CHECKING
 import asyncio
 import json
 import os
 import random
-import threading
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+from config.logger import setup_logging
+from core.utils.stroke_query import (
+    GENERIC_CLARIFICATION,
+    StrokeClarification,
+    display_character,
+    is_han_character,
+    to_simplified,
+    variant_examples,
+)
+from plugins_func.register import Action, ActionResponse, ToolType, register_function
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -42,166 +25,39 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
-# === 配置 ===
-# 笔顺图片公网入口（gzcvm NPM stream: 175.178.247.160:18090 → 192.168.1.170:8090）。
-# 服务端只推这一个外网 URL，不区分设备所在网络位置 —— 设备所处网络的判断 + URL
-# 改写完全在固件端完成，服务端保持无状态。
-#
-# 固件端机制（详见 firmware/src/main/boards/boilon-v2/boilon_network_route.h）：
-#   1) 设备开机连 WiFi 后，如果本机 IP 以 "192.168.1." 开头，TCP 探测内网
-#      OTA 端口 192.168.1.170:18002（800ms 超时），结果缓存到下次重启。
-#   2) RewriteStrokeUrlForActiveNetwork() 在内网模式下把笔顺 GIF URL 中的
-#      "http://175.178.247.160:18090/strokes" 替换为
-#      "http://192.168.1.170:8090/strokes"（注意端口也不一样）。
-#   3) RewriteHostForActiveNetwork() 同样改写 OTA / WebSocket / 固件下载等 URL。
-#
-# 因此设备在两种网络下的行为：
-#   - 大陆外网（公网 NAT IP）   → 跳过探测 → 走 175.178.247.160:18090（NPM 转发）
-#   - 香港家里 192.168.1.x 内网 → 探测通 → 自动改写为 192.168.1.170:8090 直连
-#
-# 注意事项：
-#   - 探测结果用 static 缓存，外网→内网切换 WiFi 后需要重启设备才会重新探测。
-IMG_BASE_URL = "http://175.178.247.160:18090/strokes"
+# Boilon V2 firmware rewrites this exact prefix to the Hong Kong LAN when available.
+DEFAULT_IMAGE_BASE_URL = "http://175.178.247.160:18090/strokes"
+MCP_TOOL_NAME = "self.screen.preview_image"
+MCP_TIMEOUT_SECONDS = 5
 
-# 图片格式：优先 GIF（动画笔顺），fallback PNG（静态）
-# 设备固件 SetPreviewImage 已支持 GIF 检测和 LvglGif 播放
-IMG_FORMAT = "png"          # 默认格式（保证可用）
-GIF_ENABLED = True          # 启用 GIF 动画笔顺（设备固件已支持）
-
-# 图片显示策略：
-# 自定义固件已将 PREVIEW_IMAGE_DURATION_MS 改为 120000（120秒）
-# 不需要重发循环，发送一次即可持久显示
-# TTS 结束也不会触发图片消失（已确认代码中只有 preview_timer 控制消失）
-
-# 默认显示繁体字（需求要求）
-# 当 LLM 传入简体字时，自动转换为繁体字查找对应 PNG
-USE_TRADITIONAL = True
-
-# 测试模式开关（正常使用时设为 False）
-TEST_MODE = False
-TEST_IMAGES = []
-TEST_INTERVAL = 5
-
-# MCP 工具名（设备端注册的名字，带点号）
-MCP_ORIGINAL_NAME = "self.screen.preview_image"
-
-# === 古诗倒排索引 ===
-# 启动时一次性载入 data/poem_index.json 到模块级 dict，O(1) 查询。
-# 索引由 scripts/build_poem_index.py 从 data/poems_curated.json 生成，
-# 完整设计文档见 firmware/docs/poem-database.md。
-#
-# 设计动机：早期让 LLM 直接出 poem_line 字段，反复出现"主题联想错位"
-# （如 character='病' LLM 给"巴山夜雨"——主题相关但字面没"病"），且 LLM
-# 流式生成 12-20 字诗导致 tool_calls 完整化耗时 3-5 秒。改成本地查表后：
-# 1) 100% 字面包含；2) LLM tool_calls JSON 短了，整体起播延迟 -2~4 秒。
-_POEM_INDEX_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'poem_index.json')
-)
-POEM_INDEX = {}
+_POEM_INDEX_PATH = Path(__file__).resolve().parents[2] / "data" / "poem_index.json"
 try:
-    with open(_POEM_INDEX_PATH, encoding='utf-8') as _f:
-        POEM_INDEX = json.load(_f)
-    logger.bind(tag=TAG).info(
-        f"[poem-index] 载入成功: {len(POEM_INDEX)} 个汉字, "
-        f"{sum(len(v) for v in POEM_INDEX.values())} (字→诗) 对, "
-        f"path={_POEM_INDEX_PATH}"
-    )
-except FileNotFoundError:
-    logger.bind(tag=TAG).warning(
-        f"[poem-index] 索引文件不存在 ({_POEM_INDEX_PATH})。"
-        f"请运行 scripts/build_poem_index.py 生成。"
-        f"功能降级：只播'这是X字。'，不带古诗。"
-    )
-except Exception as e:
-    logger.bind(tag=TAG).error(
-        f"[poem-index] 加载失败 ({type(e).__name__}: {e})，降级到无诗模式"
-    )
+    with _POEM_INDEX_PATH.open(encoding="utf-8") as poem_file:
+        POEM_INDEX = json.load(poem_file)
+    logger.bind(tag=TAG).info(f"笔顺诗库已载入，覆盖 {len(POEM_INDEX)} 个字")
+except (OSError, ValueError) as error:
+    logger.bind(tag=TAG).warning(f"笔顺诗库不可用: {error}")
+    POEM_INDEX = {}
 
-
-def _pick_poem(char: str, display_char: str = "") -> str:
-    """
-    从倒排索引随机抽一句包含该字的诗。
-    char 优先用简体字查（数据集都是简体）；display_char 是繁体兜底。
-    无匹配返回空字符串。
-    """
-    candidates = POEM_INDEX.get(char) or (POEM_INDEX.get(display_char) if display_char else None)
-    if not candidates:
-        return ""
-    return random.choice(candidates)
-
-
-# === 简体→繁体转换 ===
-# 只包含简繁写法不同的常用字对照
-# 格式：简体字 → 繁体字（一一对应）
-_S2T_SIMPLE = "万与专业丛东丝两严丧个丰临为丽举义乐书买乱亏云亚产亲亿仅从仓仪们价众优会伞伟传伤伦体余佣侠侣侥侦侧侨俩俭债倾储儿兑党兰关兴养兽内冈册写军农冲决况冻净减凤凭击凿划刘则刚创删剂剑剧劝办务动励劲劳势勋区医华协卖卢卧卫却厂厅历厉压厌厢厦厨县参双发变叙叠叶号叹听吕吗吨启吴呕员呛呜响哑团围图圆圣场坏块坚坛坝坞坟坠垒垦垫墙壮声壳壶处备复够头夸夹夺奋奖奥妆妇妈娄娇婴孙学宁宝实宠审宪宫宽宾对寻导寿将尔尘尧尽层属岁岂岗岚岛岭峡崭巩币帅师帐帘带帮干并广庄庆庐库应庙庞废开异弃张弥弯弹强归当录彻径忆忧怀态总恋恳恶悬惊惨惩惫惭惮惯愤愿慑懒战户扑扩扫扬扰抚担拟拢拣拥拦拧拨择挂挚挛挞挟挠挡挣挤挥捞损捡换据掷搁搅摄摆摇摈摊撑撵攒敌敛数斋断无旧时旷昙显晋晒晓晕暂术朴杂权条来杨杰松极构枢枪枫柜标栈栋栏树样桥桩梦检棉楼榄橱欢欧歼殁残殴毁毕毙毡气氢汇汉汤汹沟没沥沦沧沪泞泪泻泼泽洁洒浅浆浇浊测济浏浑浓涂涌涛涝涟涡涣涤润涨涩渊渍渐渔渗温湾湿溃满滤滥滨滩漓潇潜澜灏灭灯灵灶灿炉炖点炼烁烂烛烟烦烧烨烫热爱爷牵犹独献环现珐琼瑶电画畅畴疗疟疡疮疯痈痉痒痨痪痫瘪瘫瘾癞癣皑盏盐监盖盗盘着睁瞒矫矶矾矿砖砚砺确硕碍碱礼祷祸禀禅离种积称秆秃稳穷窃窍窑窜窝窥竖竞笃笔笼笺筑筛筝签简篮篱类粜粮糁纟纠红纤约级纪纬纯纱纲纳纵纷纸纹纺纽线练组细织终绍经绑绒结绕绘给络绝绞统绢绣绥继绩绪续绮绰绳维绵绷绸综绽绿缀缄缅缆缉缎编缘缚缝缠缤缩缭缰罂网罗罚罢羁翘耸聂聋职联聪肃肠肤肾肿胀胁胆胧胶脉脏脐脑脓脚脱脸腊腻腾舆舰艰艳艺节芜芦苍苏苹范茎荆荐荚荡荣荤荧药莱莲获莹萝营萧葱蒋蒙蓝蔷蔺藓虏虑虚蚀蚁蛊蛮蛰蜕蜗蝇蝉补衬袄袜袭装裤褴觉觉触誉讠计订认讥讨让训议讯记讲许论讼设访诀证评诈诉诊词译试诗诚话诞诡询该详诧语误诱说请诸读课谁调谅谈谊谋谍谎谐谒谓谕谗谙谚谛谜谢谣谤谦谨谬谭谱谴赵赶趋跃踊踌踪蹑躯车轧轨轩转轮软轰轴轻载较辅辆辈辉辍辐辑输辖辗辙辞辩辫边辽达迁过迈运还进远违连迟适选递逻遗邓邮邻郁郑鉴鉴锁针钉钓钟钢钥钩钻铁铃铅铜铝铭银铸铺链锄锅锈锋锐锢锣锤锥锦锭键锯镀镇镜镰长门闪闭问闯闲闷闸闹闻阀阁阅阎阐阔阳阴阵阶际陆陈陕陨险随隐雏雾霭韦韧韩页顶项顺须顽顾顿颁预领颇频颖颗题颜额颠风飘飞饣饥饭饮饰饱饲饵饶饺饼馆馈馋马驭驮驰驱驳驴驶驹驻驼驾骂骄骆骇骑验骗骤髅鱼鲁鲜鲤鲸鸟鸡鸣鸭鸽鹅鹊鹤鹰麦黄齐齿龙龟"
-_S2T_TRAD = "萬與專業叢東絲兩嚴喪個豐臨為麗舉義樂書買亂虧雲亞產親億僅從倉儀們價眾優會傘偉傳傷倫體餘傭俠侶僥偵側僑倆儉債傾儲兒兌黨蘭關興養獸內岡冊寫軍農衝決況凍淨減鳳憑擊鑿劃劉則剛創刪劑劍劇勸辦務動勵勁勞勢勳區醫華協賣盧臥衛卻廠廳歷厲壓厭廂廈廚縣參雙發變敘疊葉號嘆聽呂嗎噸啟吳嘔員嗆嗚響啞團圍圖圓聖場壞塊堅壇壩塢墳墜壘墾墊牆壯聲殼壺處備複夠頭誇夾奪奮獎奧妝婦媽婁嬌嬰孫學寧寶實寵審憲宮寬賓對尋導壽將爾塵堯盡層屬歲豈崗嵐島嶺峽嶄鞏幣帥師帳簾帶幫幹並廣莊慶廬庫應廟龐廢開異棄張彌彎彈強歸當錄徹徑憶憂懷態總戀懇惡懸驚慘懲憊慚憚慣憤願懾懶戰戶撲擴掃揚擾撫擔擬攏揀擁攔擰撥擇掛摯攣撻挾撓擋掙擠揮撈損撿換據擲擱攪攝擺搖擯攤撐攆攢敵斂數齋斷無舊時曠曇顯晉曬曉暈暫術樸雜權條來楊傑鬆極構樞槍楓櫃標棧棟欄樹樣橋樁夢檢棉樓欖櫥歡歐殲歿殘毆毀畢斃氈氣氫匯漢湯洶溝沒瀝淪滄滬濘淚瀉潑澤潔灑淺漿澆濁測濟瀏渾濃塗湧濤澇漣渦渙滌潤漲澀淵漬漸漁滲溫灣濕潰滿濾濫濱灘漓瀟潛瀾灝滅燈靈竈燦爐燉點煉爍爛燭煙煩燒燁燙熱愛爺牽猶獨獻環現琺瓊瑤電畫暢疇療瘧瘍瘡瘋癰痙癢癆瘓癇癟癱癮癩癬皚盞鹽監蓋盜盤著睜瞞矯磯礬礦磚硯礪確碩礙鹼禮禱禍稟禪離種積稱稈禿穩窮竊竅窯竄窩窺豎競篤筆籠箋築篩箏簽簡籃籬類糶糧糝糸糾紅纖約級紀緯純紗綱納縱紛紙紋紡紐線練組細織終紹經綁絨結繞繪給絡絕絞統絹繡綏繼績緒續綺綽繩維綿繃綢綜綻綠綴緘緬纜緝緞編緣縛縫纏繽縮繚韁罌網羅罰罷羈翹聳聶聾職聯聰肅腸膚腎腫脹脅膽朧膠脈臟臍腦膿腳脫臉臘膩騰輿艦艱艷藝節蕪蘆蒼蘇蘋範莖荊薦莢蕩榮葷熒藥萊蓮獲瑩蘿營蕭蔥蔣矇藍薔藺蘚虜慮虛蝕蟻蠱蠻蟄蛻蝸蠅蟬補襯襖襪襲裝褲襤覺覺觸譽訁計訂認譏討讓訓議訊記講許論訟設訪訣證評詐訴診詞譯試詩誠話誕詭詢該詳詫語誤誘說請諸讀課誰調諒談誼謀諜謊諧謁謂諭讒諳諺諦謎謝謠謗謙謹謬譚譜譴趙趕趨躍踴躊蹤躡軀車軋軌軒轉輪軟轟軸輕載較輔輛輩輝輟輻輯輸轄輾轍辭辯辮邊遼達遷過邁運還進遠違連遲適選遞邏遺鄧郵鄰鬱鄭鑒鑑鎖針釘釣鐘鋼鑰鉤鑽鐵鈴鉛銅鋁銘銀鑄鋪鏈鋤鍋鏽鋒銳錮鑼錘錐錦錠鍵鋸鍍鎮鏡鐮長門閃閉問闖閒悶閘鬧聞閥閣閱閻闡闊陽陰陣階際陸陳陝隕險隨隱雛霧靄韋韌韓頁頂項順須頑顧頓頒預領頗頻穎顆題顏額顛風飄飛飠飢飯飲飾飽飼餌饒餃餅館饋饞馬馭馱馳驅駁驢駛駒駐駝駕罵驕駱駭騎驗騙驟髏魚魯鮮鯉鯨鳥雞鳴鴨鴿鵝鵲鶴鷹麥黃齊齒龍龜"
-
-# 构建简→繁映射字典
-_SIMP_TO_TRAD_MAP = {}
-for _s, _t in zip(_S2T_SIMPLE, _S2T_TRAD):
-    _SIMP_TO_TRAD_MAP[_s] = _t
-
-
-def _simp_to_trad(char: str) -> str:
-    """简体字转繁体字（单字），如果不在映射表中则返回原字"""
-    return _SIMP_TO_TRAD_MAP.get(char, char)
-
-
-# Function calling 描述
-#
-# 注意：本工具不再让 LLM 出诗。LLM 只需做两件事：
-# 1) 识别"用户想查某字怎么写"的意图（function calling 触发）
-# 2) 出正确的字（含 ASR 同音字纠错）
-#
-# 古诗朗读由服务端从本地索引（data/poem_index.json）随机抽取，
-# 详见 firmware/docs/poem-database.md。
 lookup_stroke_function_desc = {
     "type": "function",
     "function": {
         "name": "lookup_stroke",
         "description": (
-            "查询汉字写法，在屏幕显示该字的图片，并自动配一句古诗朗读。\n"
-            "当孩子问某个字怎么写、想看某个字、问笔画顺序时调用此工具。\n"
-            "\n"
-            "═══ 触发铁律（无条件）═══\n"
-            "\n"
-            "⚠️ 只要孩子说「X字怎么写」「教我写X」「看X字」「写一个X」等任何查字请求，**每一次**都必须调用此工具。\n"
-            "**绝对不要**：\n"
-            "- 自己直接回答「这是X字...」（即便上一轮刚查过同一个字也要再调用）\n"
-            "- 自己编古诗或自己说出诗句（诗由服务端从精选诗库随机抽取，每次会换不同的，**你说不出比这更好的**）\n"
-            "- 说「刚刚教过了」「还是那个字」之类的话来跳过调用\n"
-            "\n"
-            "每次调用 = 屏幕重新显示笔顺 + 朗读不同的诗。**孩子重复问 = 想多看一次 + 学一首新诗**，这是好事。\n"
-            "\n"
-            "═══ 调用前 ASR 自检（必做）═══\n"
-            "\n"
-            "孩子用语音说话，ASR 经常把同音字认错。判断逻辑：\n"
-            "\n"
-            "1) 用户问句符合「X的Y字怎么写」结构时（X 是组词上下文，Y 是要查的字），\n"
-            "   填参数前先验证：Y 是否真的出现在 X 里？\n"
-            "   - Y 在 X 中 → character=Y, context_phrase=X\n"
-            "   - Y **不在** X 中 → ASR 错了！必须把 character 改成 X 里和 Y 同音（或近音）的字。\n"
-            "\n"
-            "   案例：\n"
-            "   · 用户说「龙马的笼字」→ '笼' 不在'龙马'，但'龙'(lóng)同音 → character='龙', context_phrase='龙马'\n"
-            "   · 用户说「小朋友的有字」→ '有' 不在'小朋友'，但'友'(yǒu)同音 → character='友', context_phrase='小朋友'\n"
-            "   · 用户说「乌龟的归字」→ '归' 不在'乌龟'，但'龟'(guī)同音 → character='龟', context_phrase='乌龟'\n"
-            "\n"
-            "2) 用户问句没有「X的Y字」结构（例如「龙字怎么写」「教我写爱字」），\n"
-            "   context_phrase 留空，character 直接用用户说的字。\n"
-            "\n"
-            "3) 找不到任何同音字替换 → context_phrase 留空，character 保留原字。"
+            "当孩子在问一个汉字的写法或笔顺，而服务端还没有确认字形时，调用此工具请孩子补充组词。"
+            "答复以工具结果为准。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "character": {
-                    "type": "string",
-                    "description": "要查询笔顺的单个汉字。**必须**是 context_phrase 中真实存在的某个字（如不存在请按上面规则做 ASR 同音字纠错替换）。例：龙、人、爱。",
-                },
+                "character": {"type": "string", "description": "单个要查询的汉字。"},
                 "context_phrase": {
+                    "type": "string", "description": "用于确定字形的词组，例如‘努力’。"
+                },
+                "script": {
                     "type": "string",
-                    "description": "（可选）用户说的上下文词组。例如'龙马的龙字怎么写' → '龙马'。⚠️ 填之前必须验证 character 真的在这里面，否则就留空。",
+                    "enum": ["traditional", "simplified"],
+                    "description": "默认查繁体。用户明确要求简体时填 simplified。",
                 },
             },
             "required": ["character"],
@@ -210,231 +66,144 @@ lookup_stroke_function_desc = {
 }
 
 
-def _send_mcp_in_new_loop(conn, payload, timeout=15):
-    """
-    在新线程+新事件循环中发送 MCP 消息并等待设备响应。
+def _image_url(conn, character: str) -> str | None:
+    options = conn.config.get("character_lookup") or {}
+    base_url = (options.get("image_base_url") or DEFAULT_IMAGE_BASE_URL).strip().rstrip("/")
+    parts = urlsplit(base_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.query or parts.fragment:
+        raise ValueError("character_lookup.image_base_url 必须是 HTTP(S) 目录地址")
 
-    为什么不能用 conn.loop？
-    因为 lookup_stroke() 是被 plugin_executor 在 conn.loop 的事件循环线程中
-    同步调用的。如果用 run_coroutine_threadsafe(coro, conn.loop).result()，
-    会阻塞事件循环线程，导致协程无法被调度 → 死锁。
+    codepoint = f"{ord(character):x}"
+    asset_directory = options.get("asset_directory") or os.environ.get("STROKE_ASSET_DIRECTORY")
+    if not asset_directory:
+        return f"{base_url}/{codepoint}.gif"
 
-    解决方案：
-    1. 在新线程中创建新的事件循环
-    2. 用新事件循环调用 conn.websocket.send()（websockets 支持跨线程 send）
-    3. 不阻塞 conn.loop
-    """
-    result_holder = {"result": None, "error": None}
-    done_event = threading.Event()
-
-    def _worker():
-        try:
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-
-            async def _send_and_wait():
-                message = json.dumps({"type": "mcp", "payload": payload})
-                logger.bind(tag=TAG).info(
-                    f"[新线程] 发送 MCP 消息: method={payload.get('method')}, "
-                    f"id={payload.get('id')}"
-                )
-                await conn.websocket.send(message)
-                logger.bind(tag=TAG).info(
-                    f"[新线程] MCP 消息已发送(id={payload.get('id')})"
-                )
-
-            new_loop.run_until_complete(_send_and_wait())
-            new_loop.close()
-            result_holder["result"] = "sent"
-        except Exception as e:
-            result_holder["error"] = e
-            logger.bind(tag=TAG).error(f"[新线程] 发送 MCP 消息失败: {e}")
-        finally:
-            done_event.set()
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-    done_event.wait(timeout=timeout)
-
-    if result_holder["error"]:
-        raise result_holder["error"]
-    if not done_event.is_set():
-        raise TimeoutError("发送 MCP 消息超时")
-    return result_holder["result"]
+    directory = Path(asset_directory)
+    if not directory.is_dir():
+        raise OSError(f"笔顺图片目录不可用: {directory}")
+    for extension in ("gif", "png"):
+        filename = f"{codepoint}.{extension}"
+        if (directory / filename).is_file():
+            return f"{base_url}/{filename}"
+    return None
 
 
+async def _preview_image(conn, image_url: str, *, sentence_id: str | None = None):
+    client = conn.mcp_client
+    tool_id = await client.get_next_id()
+    while tool_id < 3:  # 初始化和工具列表占用 ID 1、2。
+        tool_id = await client.get_next_id()
+    result_future = asyncio.get_running_loop().create_future()
+    await client.register_call_result_future(tool_id, result_future)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": tool_id,
+        "method": "tools/call",
+        # This user-only tool can be called by trusted code and stays out of the LLM's tool list.
+        "params": {"name": MCP_TOOL_NAME, "arguments": {"url": image_url}},
+    }
+    try:
+        result = await asyncio.wait_for(
+            _send_and_wait_for_preview(conn, payload, result_future, sentence_id),
+            MCP_TIMEOUT_SECONDS,
+        )
+        if not isinstance(result, dict) or result.get("isError"):
+            raise RuntimeError(f"设备未接受笔顺预览: {result}")
+    finally:
+        await client.cleanup_call_result(tool_id)
 
+
+async def _send_and_wait_for_preview(conn, payload, result_future, sentence_id):
+    if sentence_id is not None and (conn.sentence_id != sentence_id or conn.client_abort):
+        raise RuntimeError("本轮查字已结束")
+    await conn.websocket.send(json.dumps({"type": "mcp", "payload": payload}))
+    return await result_future
 
 
 @register_function("lookup_stroke", lookup_stroke_function_desc, ToolType.SYSTEM_CTL)
-def lookup_stroke(conn: "ConnectionHandler", character: str, context_phrase: str = ""):
-    """查询汉字笔顺，在设备屏幕显示笔顺图片，并朗读一句包含此字的古诗
+async def lookup_stroke(
+    conn: "ConnectionHandler", character: str = "", context_phrase: str = "", script: str = "traditional"
+):
+    """Ask for spoken context when the model cannot verify the desired character."""
+    return ActionResponse(
+        action=Action.RESPONSE,
+        result="需要组词确认字形",
+        response=GENERIC_CLARIFICATION,
+    )
 
-    参数：
-        character:      要查询的单个汉字（LLM 已经做过 ASR 同音字自动纠错）
-        context_phrase: 用户说的上下文词组（用于日志观测纠错效果，不参与 TTS）
 
-    古诗由服务端从本地索引（POEM_INDEX）随机抽取，LLM 不再参与选诗。
-    """
-
-    # 0. 观测日志：直接打印 LLM 传过来的两个参数，方便 grep 看自动纠错效果
-    #    （如果用户说"龙马的笼字"，LLM 应输出 character="龙", context_phrase="龙马"）
-    if context_phrase:
-        if character in context_phrase:
-            logger.bind(tag=TAG).info(
-                f"[ASR-OK] character={character} 在上下文'{context_phrase}'中"
-            )
-        else:
-            logger.bind(tag=TAG).warning(
-                f"[ASR-FIX-FAILED?] character={character} 不在上下文'{context_phrase}'中 "
-                f"（LLM 可能没找到合适的同音字替代，按原字处理）"
-            )
-    else:
-        logger.bind(tag=TAG).info(f"[ASR-NO-CTX] character={character}（无上下文）")
-
-    # 1. 参数校验
-    if not character or len(character.strip()) == 0:
+async def show_confirmed_stroke(
+    conn: "ConnectionHandler", character: str, context_phrase: str = "", script: str = "traditional",
+    *, sentence_id: str | None = None,
+):
+    """Send one local stroke asset selected by the server-side utterance parser."""
+    char = character.strip() if isinstance(character, str) else ""
+    if not is_han_character(char):
         return ActionResponse(
             action=Action.RESPONSE,
-            result="参数为空",
+            result="需要单个汉字",
             response="你想查哪个字呀？告诉我一个字就好！",
         )
 
-    # 取第一个字符（防止 LLM 传了多个字）
-    char = character.strip()[0]
-
-    # 检查是否是汉字（CJK Unified Ideographs 基本范围 + 扩展）
-    cp = ord(char)
-    is_cjk = (
-        (0x4E00 <= cp <= 0x9FFF)       # CJK Unified Ideographs
-        or (0x3400 <= cp <= 0x4DBF)    # CJK Unified Ideographs Extension A
-        or (0x20000 <= cp <= 0x2A6DF)  # CJK Unified Ideographs Extension B
-        or (0xF900 <= cp <= 0xFAFF)    # CJK Compatibility Ideographs
-    )
-    if not is_cjk:
+    context = context_phrase.strip() if isinstance(context_phrase, str) else ""
+    display_char = display_character(char, context, script)
+    if display_char is None:
         return ActionResponse(
             action=Action.RESPONSE,
-            result="非汉字",
-            response=char + "好像不是汉字哦，我只能查汉字的笔顺呢！",
+            result="需要组词确认字形",
+            response=StrokeClarification(char, script, variant_examples(char)).prompt,
         )
 
-    # 2. 简体→繁体转换（需求要求默认显示繁体）
-    display_char = char
-    if USE_TRADITIONAL:
-        trad_char = _simp_to_trad(char)
-        if trad_char != char:
-            logger.bind(tag=TAG).info(f"简→繁转换: {char} → {trad_char}")
-            display_char = trad_char
+    if context and char in context:
+        display_context = context.replace(char, display_char)
+        intro = f"这是{display_context}的{display_char}字。"
+    elif display_char != char:
+        script_name = "简体" if script == "simplified" else "繁体"
+        intro = f"这是{script_name}的{display_char}字。"
+    else:
+        intro = f"这是{char}字。"
 
-    # 3. 计算 Unicode hex → 图片 URL
-    cp_display = ord(display_char)
-    hex_str = format(cp_display, "x")  # 小写十六进制，如 '9f8d'
-
-    # 4. 检查设备是否支持 MCP（有屏幕）
-    if not hasattr(conn, "mcp_client") or not conn.mcp_client:
-        logger.bind(tag=TAG).warning("设备不支持 MCP，无法显示笔顺图片")
+    if not getattr(conn, "mcp_client", None):
         return ActionResponse(
             action=Action.RESPONSE,
-            result="设备无屏幕",
-            response=f"你问的是{char}字对吧？可惜我这里没有屏幕，没法显示笔顺呢。",
+            result="设备不支持屏幕预览",
+            response=intro + "这台设备不能显示笔顺图。",
         )
 
-    # === 测试模式 ===
-    if TEST_MODE:
-        logger.bind(tag=TAG).info("=" * 60)
-        logger.bind(tag=TAG).info("[测试模式] 开始图片格式兼容性测试")
-        logger.bind(tag=TAG).info("=" * 60)
-
-        results = []
-        for i, (fmt, url) in enumerate(TEST_IMAGES):
-            if not hasattr(lookup_stroke, "_call_counter"):
-                lookup_stroke._call_counter = 1000
-            lookup_stroke._call_counter += 1
-            tool_call_id = lookup_stroke._call_counter
-
-            payload = {
-                "jsonrpc": "2.0",
-                "id": tool_call_id,
-                "method": "tools/call",
-                "params": {"name": MCP_ORIGINAL_NAME, "arguments": {"url": url}},
-            }
-
-            try:
-                _send_mcp_in_new_loop(conn, payload, timeout=10)
-                results.append(f"{fmt}:已发送")
-            except Exception as e:
-                results.append(f"{fmt}:发送失败({e})")
-
-            if i < len(TEST_IMAGES) - 1:
-                time.sleep(TEST_INTERVAL)
-
-        summary = ", ".join(results)
-        return ActionResponse(
-            action=Action.RESPONSE,
-            result=f"图片格式测试完毕: {summary}",
-            response="我在屏幕上依次测试了图片格式。你看看哪些能显示出来！",
-        )
-
-    # === 正常模式 ===
-    # 直接默认 GIF。strokes 数据集已确认完整覆盖（GIF 9575 个 + PNG 9574 个，
-    # 一字一对配对），常用汉字必有 GIF。
-    # 历史代码这里有 HEAD 请求验证 GIF 是否存在（早期数据集只有 PNG 时的兜底），
-    # 现在已无必要 — 每次 HEAD 请求耗时 100ms-2s，对儿童设备体验影响明显。
-    # 万一极冷僻字真没 GIF，固件下载 404 → 屏幕空白几秒 → preview_timer 60s
-    # 自动恢复 emoji，体验上可接受。
-    img_url = f"{IMG_BASE_URL}/{hex_str}.gif"
-    used_format = "gif"
-    
-    logger.bind(tag=TAG).info(
-        f"笔顺查询: {char}"
-        + (f"(繁体:{display_char})" if display_char != char else "")
-        + f" → U+{hex_str.upper()} → {img_url} [{used_format}]"
-    )
-
-    # 5. 通过 MCP 在设备屏幕上显示图片（只发一次，固件定时器 120 秒）
     try:
-        if not hasattr(lookup_stroke, "_call_counter"):
-            lookup_stroke._call_counter = 0
-        lookup_stroke._call_counter += 1
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": lookup_stroke._call_counter,
-            "method": "tools/call",
-            "params": {"name": MCP_ORIGINAL_NAME, "arguments": {"url": img_url}},
-        }
-        _send_mcp_in_new_loop(conn, payload, timeout=15)
-        logger.bind(tag=TAG).info(f"MCP 发送成功: {img_url}")
-
-        # 构造语音回复（保持简短，孩子注意力短）
-        # 屏幕已经显示了字本身，TTS 不需要复述上下文（context_phrase 仅用于
-        # 让 LLM 做 ASR 自检 + 服务端日志观测，不参与 TTS）。
-        intro_text = f"这是{char}字。"
-
-        # 古诗：本地索引随机抽（character 是简体，display_char 是繁体兜底）
-        poem_clean = _pick_poem(char, display_char)
-        if poem_clean:
-            poem_text = poem_clean + "。"
-            logger.bind(tag=TAG).info(f"[POEM-OK] character={char}, poem='{poem_clean}'")
-        else:
-            poem_text = ""
-            logger.bind(tag=TAG).info(
-                f"[POEM-EMPTY] 索引中没有含字'{char}'的诗 — fallback 到精简 TTS"
-            )
-
-        # 最终 TTS：intro + 可选的诗句
-        tts_text = intro_text + poem_text
-
+        image_url = _image_url(conn, display_char)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        logger.bind(tag=TAG).error(f"笔顺图片配置错误: {error}")
+        image_url = None
+    if image_url is None:
+        logger.bind(tag=TAG).warning(f"笔顺图片不可用: {display_char} U+{ord(display_char):04X}")
         return ActionResponse(
             action=Action.RESPONSE,
-            result=f"已发送 {display_char} 的笔顺到屏幕",
-            response=tts_text,
+            result="没有可用的笔顺图片",
+            response=intro + "我暂时找不到这个字的笔顺图。",
         )
 
-    except Exception as e:
-        logger.bind(tag=TAG).error(f"MCP 调用失败: {e}", exc_info=True)
+    try:
+        await _preview_image(conn, image_url, sentence_id=sentence_id)
+    except Exception as error:
+        logger.bind(tag=TAG).warning(f"设备笔顺预览失败: {type(error).__name__}: {error}")
         return ActionResponse(
             action=Action.RESPONSE,
-            result=f"MCP 调用失败: {e}",
-            response=f"哎呀，屏幕显示出了点问题。{char}字你可以问爸爸妈妈帮你写一遍看看！",
+            result="设备笔顺预览未确认",
+            response=intro + "屏幕暂时没能打开笔顺图。",
         )
+
+    logger.bind(tag=TAG).info(f"设备已回复笔顺预览: {display_char} U+{ord(display_char):04X}")
+    source_char = to_simplified(char)
+    poems = [
+        poem for poem in POEM_INDEX.get(source_char, ())
+        if display_character(source_char, poem, script) == display_char
+    ]
+    if display_char != source_char:
+        poems.extend(POEM_INDEX.get(display_char, ()))
+    response = f"{intro}{random.choice(poems)}。" if poems else intro
+    return ActionResponse(
+        action=Action.RESPONSE,
+        result=f"设备已处理 {display_char} 的笔顺预览",
+        response=response,
+    )

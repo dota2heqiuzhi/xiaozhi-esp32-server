@@ -1,5 +1,6 @@
 """服务端插件工具执行器"""
 
+from inspect import isawaitable
 from typing import Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ class ServerPluginExecutor(ToolExecutor):
                 # 默认不传conn参数
                 result = func_item.func(**arguments)
 
-            return result
+            return await result if isawaitable(result) else result
 
         except Exception as e:
             return ActionResponse(

@@ -1,6 +1,7 @@
 import json
 import uuid
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -11,13 +12,23 @@ from core.handle.helloHandle import checkWakeupWords
 from plugins_func.register import Action, ActionResponse
 from core.handle.sendAudioHandle import send_stt_message
 from core.handle.reportHandle import enqueue_tool_report
+from core.utils.stroke_query import (
+    display_character,
+    get_stroke_clarification,
+    get_stroke_follow_up_clarification,
+    looks_like_stroke_query,
+    parse_stroke_follow_up,
+    parse_stroke_query,
+)
 from core.utils.util import remove_punctuation_and_length
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType
+from plugins_func.functions.lookup_stroke import lookup_stroke, show_confirmed_stroke
 
 TAG = __name__
+STROKE_FOLLOW_UP_SECONDS = 30
 
 
-async def handle_user_intent(conn: "ConnectionHandler", text):
+async def handle_user_intent(conn: "ConnectionHandler", text, *, spoken=False):
     # 预处理输入文本，处理可能的JSON格式
     try:
         if text.strip().startswith("{") and text.strip().endswith("}"):
@@ -37,6 +48,35 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     if await checkWakeupWords(conn, filtered_text):
         return True
 
+    if getattr(conn, "func_handler", None) and conn.func_handler.has_tool("lookup_stroke"):
+        pending = getattr(conn, "pending_stroke_clarification", None)
+        if pending is not None:
+            conn.pending_stroke_clarification = None
+        stroke_query = parse_stroke_query(text, spoken=spoken)
+        is_stroke_request = stroke_query is not None or looks_like_stroke_query(text, spoken=spoken)
+        if spoken and stroke_query and not stroke_query["context_phrase"]:
+            # A single spoken syllable does not identify which homophone to show.
+            stroke_query = None
+        clarification = None
+        if spoken and not is_stroke_request and pending and time.monotonic() < pending[0]:
+            stroke_query = parse_stroke_follow_up(text, pending[1])
+            if stroke_query is None:
+                clarification = get_stroke_follow_up_clarification(text, pending[1])
+        if is_stroke_request and stroke_query is None:
+            clarification = get_stroke_clarification(text, spoken=spoken)
+        if stroke_query or is_stroke_request or clarification is not None:
+            if spoken and clarification is not None:
+                conn.pending_stroke_clarification = (
+                    time.monotonic() + STROKE_FOLLOW_UP_SECONDS, clarification
+                )
+            return await process_intent_result(
+                conn,
+                {"function_call": {"name": "lookup_stroke"}},
+                text,
+                confirmed_stroke=stroke_query,
+                stroke_clarification=clarification.prompt if clarification is not None else None,
+            )
+
     if conn.intent_type == "function_call":
         # 使用支持function calling的聊天方法,不再进行意图分析
         return False
@@ -44,8 +84,6 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     intent_result = await analyze_intent_with_llm(conn, text)
     if not intent_result:
         return False
-    # 会话开始时生成sentence_id
-    conn.sentence_id = str(uuid.uuid4().hex)
     # 处理各种意图
     return await process_intent_result(conn, intent_result, text)
 
@@ -81,12 +119,13 @@ async def analyze_intent_with_llm(conn: "ConnectionHandler", text):
 
 
 async def process_intent_result(
-    conn: "ConnectionHandler", intent_result, original_text
+    conn: "ConnectionHandler", intent_result, original_text, *,
+    confirmed_stroke=None, stroke_clarification=None,
 ):
     """处理意图识别结果"""
     try:
         # 尝试将结果解析为JSON
-        intent_data = json.loads(intent_result)
+        intent_data = json.loads(intent_result) if isinstance(intent_result, str) else intent_result
 
         # 检查是否有function_call
         if "function_call" in intent_data:
@@ -98,9 +137,12 @@ async def process_intent_result(
             if function_name == "continue_chat":
                 return False
 
+            sentence_id = uuid.uuid4().hex
+            conn.sentence_id = sentence_id
+            conn.client_abort = False
+
             if function_name == "result_for_context":
                 await send_stt_message(conn, original_text)
-                conn.client_abort = False
 
                 def process_context_result():
                     conn.dialogue.put(Message(role="user", content=original_text))
@@ -119,13 +161,16 @@ async def process_intent_result(
                                         请根据以上信息回答用户的问题：{original_text}"""
 
                     response = conn.intent.replyResult(context_prompt, original_text)
-                    speak_txt(conn, response)
+                    speak_txt(conn, response, sentence_id)
 
                 conn.executor.submit(process_context_result)
                 return True
 
             function_args = {}
-            if "arguments" in intent_data["function_call"]:
+            if function_name == "lookup_stroke":
+                # Model arguments cannot authorize a character preview.
+                function_args = confirmed_stroke or {}
+            elif "arguments" in intent_data["function_call"]:
                 function_args = intent_data["function_call"]["arguments"]
                 if function_args is None:
                     function_args = {}
@@ -139,8 +184,17 @@ async def process_intent_result(
                 "arguments": function_args,
             }
 
-            await send_stt_message(conn, original_text)
-            conn.client_abort = False
+            display_text = original_text
+            if function_name == "lookup_stroke":
+                character = display_character(**confirmed_stroke) if confirmed_stroke else None
+                if character:
+                    conn.logger.bind(tag=TAG).info(f"本地识别查字: {character}")
+                    display_text = f"查字 {character}"
+                else:
+                    conn.logger.bind(tag=TAG).info("查字需确认组词")
+                    display_text = "查字"
+
+            await send_stt_message(conn, display_text)
 
             # 准备工具调用参数
             tool_input = {}
@@ -155,18 +209,36 @@ async def process_intent_result(
 
             # 使用executor执行函数调用和结果处理
             def process_function_call():
-                conn.dialogue.put(Message(role="user", content=original_text))
+                if conn.sentence_id != sentence_id or conn.client_abort:
+                    return
+                conn.dialogue.put(Message(role="user", content=display_text))
                 
                 # 工具调用超时时间
                 tool_call_timeout = int(conn.config.get("tool_call_timeout", 30))
                 # 使用统一工具处理器处理所有工具调用
                 try:
-                    result = asyncio.run_coroutine_threadsafe(
-                        conn.func_handler.handle_llm_function_call(
+                    if function_name == "lookup_stroke":
+                        if stroke_clarification:
+                            result = ActionResponse(
+                                action=Action.RESPONSE,
+                                result="需要组词确认字形",
+                                response=stroke_clarification,
+                            )
+                            tool_call = None
+                        elif confirmed_stroke:
+                            tool_call = show_confirmed_stroke(
+                                conn, **confirmed_stroke, sentence_id=sentence_id
+                            )
+                        else:
+                            tool_call = lookup_stroke(conn)
+                    else:
+                        tool_call = conn.func_handler.handle_llm_function_call(
                             conn, function_call_data
-                        ),
-                        conn.loop,
-                    ).result(timeout=tool_call_timeout)
+                        )
+                    if tool_call is not None:
+                        result = asyncio.run_coroutine_threadsafe(
+                            tool_call, conn.loop
+                        ).result(timeout=tool_call_timeout)
                 except Exception as e:
                     conn.logger.bind(tag=TAG).error(f"工具调用失败: {e}")
                     result = ActionResponse(
@@ -177,24 +249,27 @@ async def process_intent_result(
                 if result:
                     enqueue_tool_report(conn, function_name, tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
+                    if conn.sentence_id != sentence_id or conn.client_abort:
+                        return
+
                     if result.action == Action.RESPONSE:  # 直接回复前端
                         text = result.response
                         if text is not None:
-                            speak_txt(conn, text)
+                            speak_txt(conn, text, sentence_id)
                     elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
                         text = result.result
                         conn.dialogue.put(Message(role="tool", content=text))
                         llm_result = conn.intent.replyResult(text, original_text)
                         if llm_result is None:
                             llm_result = text
-                        speak_txt(conn, llm_result)
+                        speak_txt(conn, llm_result, sentence_id)
                     elif (
                         result.action == Action.NOTFOUND
                         or result.action == Action.ERROR
                     ):
                         text = result.response if result.response else result.result
                         if text is not None:
-                            speak_txt(conn, text)
+                            speak_txt(conn, text, sentence_id)
                     elif function_name != "play_music":
                         # For backward compatibility with original code
                         # 获取当前最新的文本索引
@@ -202,7 +277,7 @@ async def process_intent_result(
                         if text is None:
                             text = result.result
                         if text is not None:
-                            speak_txt(conn, text)
+                            speak_txt(conn, text, sentence_id)
 
             # 将函数执行放在线程池中
             conn.executor.submit(process_function_call)
@@ -213,21 +288,25 @@ async def process_intent_result(
         return False
 
 
-def speak_txt(conn: "ConnectionHandler", text):
+def speak_txt(conn: "ConnectionHandler", text, sentence_id):
+    if conn.sentence_id != sentence_id or conn.client_abort:
+        return
     # 记录文本到 sentence_id 映射
-    conn.tts.store_tts_text(conn.sentence_id, text)
+    conn.tts.store_tts_text(sentence_id, text)
 
     conn.tts.tts_text_queue.put(
         TTSMessageDTO(
-            sentence_id=conn.sentence_id,
+            sentence_id=sentence_id,
             sentence_type=SentenceType.FIRST,
             content_type=ContentType.ACTION,
         )
     )
-    conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=text)
+    conn.tts.tts_one_sentence(
+        conn, ContentType.TEXT, content_detail=text, sentence_id=sentence_id
+    )
     conn.tts.tts_text_queue.put(
         TTSMessageDTO(
-            sentence_id=conn.sentence_id,
+            sentence_id=sentence_id,
             sentence_type=SentenceType.LAST,
             content_type=ContentType.ACTION,
         )

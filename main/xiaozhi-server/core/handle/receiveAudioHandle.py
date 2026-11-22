@@ -52,7 +52,7 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
     conn.just_woken_up = False
 
 
-async def startToChat(conn: "ConnectionHandler", text):
+async def startToChat(conn: "ConnectionHandler", text, *, spoken=False):
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     language_tag = None
@@ -101,7 +101,7 @@ async def startToChat(conn: "ConnectionHandler", text):
         conn.clearSpeakStatus()
 
     # 首先进行意图分析，使用实际文本内容
-    intent_handled = await handle_user_intent(conn, actual_text)
+    intent_handled = await handle_user_intent(conn, actual_text, spoken=spoken)
 
     if intent_handled:
         # 如果意图已被处理，不再进行聊天

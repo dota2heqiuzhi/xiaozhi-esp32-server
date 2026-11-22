@@ -29,6 +29,7 @@ from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
 from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
+from core.handle.receiveAudioHandle import handleAudioMessage
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
 from plugins_func.loadplugins import auto_import_modules
@@ -45,6 +46,9 @@ from core.utils import textUtils
 
 
 TAG = __name__
+
+# ESP32 固件等待服务端 hello 的总时限是 10 秒，留出网络往返和重连时间。
+HELLO_AUDIO_READY_TIMEOUT = 6
 
 # 工具调用规则 - 用于动态注入提醒
 TOOL_CALLING_RULES = """
@@ -104,6 +108,7 @@ class ConnectionHandler:
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
+        self.audio_ready_event = asyncio.Event()
         self.bind_code = None  # 绑定设备的验证码
         self.last_bind_prompt_time = 0  # 上次播放绑定提示的时间戳(秒)
         self.bind_prompt_interval = 60  # 绑定提示播放间隔(秒)
@@ -165,6 +170,9 @@ class ConnectionHandler:
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []
         self.asr_audio_queue = queue.Queue()
+        self.accepting_asr_audio = True
+        self.latest_listen_start_id = 0
+        self.active_listen_start_id = 0
         self.current_speaker = None  # 存储当前说话人
 
         # llm相关变量
@@ -325,15 +333,40 @@ class ConnectionHandler:
 
             asyncio.create_task(check_bind_device(self))
 
+    async def _wait_for_hello_audio_ready(self):
+        await self.bind_completed_event.wait()
+        if not self.need_bind:
+            await self.audio_ready_event.wait()
+
     async def _route_message(self, message):
         """消息路由"""
-        # 检查是否已经获取到真实的绑定状态
-        if not self.bind_completed_event.is_set():
-            # 还没有获取到真实状态，等待直到获取到真实状态或超时
+        message_type = None
+        if isinstance(message, str):
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(payload, dict):
+                    message_type = payload.get("type")
+
+        if message_type == "hello":
+            features = payload.get("features")
+            if isinstance(features, dict):
+                self.features = features
+            # 设备收到 hello 回复后就会播放提示音并开始发音频。
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_hello_audio_ready(), timeout=HELLO_AUDIO_READY_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                self.logger.bind(tag=TAG).warning("等待设备音频通道就绪超时")
+                await self.websocket.close(code=1013, reason="audio initialization timeout")
+                return
+        elif not self.bind_completed_event.is_set():
             try:
                 await asyncio.wait_for(self.bind_completed_event.wait(), timeout=1)
             except asyncio.TimeoutError:
-                # 超时仍未获取到真实状态，丢弃消息
                 await self._discard_message_with_bind_prompt()
                 return
 
@@ -346,17 +379,26 @@ class ConnectionHandler:
         # 不需要绑定，继续处理消息
 
         if isinstance(message, str):
-            # 过滤心跳 ping 消息（仅用于刷新 last_activity_time，无需进一步处理）
-            try:
-                import json as _json
-                _msg = _json.loads(message)
-                if _msg.get('type') == 'ping':
-                    return
-            except Exception:
-                pass
-            await handleTextMessage(self, message)
+            if message_type == "listen":
+                state = payload.get("state")
+                if state == "detect":
+                    self.accepting_asr_audio = True
+                elif state in ("start", "stop"):
+                    if not self.audio_ready_event.is_set():
+                        return
+                    if self.asr.interface_type != InterfaceType.STREAM:
+                        # Keep recording boundaries in order with the matching audio frames.
+                        self.accepting_asr_audio = state == "start"
+                        if state == "start":
+                            self.latest_listen_start_id += 1
+                            self.asr_audio_queue.put((message, self.latest_listen_start_id))
+                        else:
+                            self.asr_audio_queue.put(message)
+                        return
+            if message_type != "ping":
+                await handleTextMessage(self, message)
         elif isinstance(message, bytes):
-            if self.vad is None or self.asr is None:
+            if not self.audio_ready_event.is_set() or not self.accepting_asr_audio:
                 return
 
             # 处理来自MQTT网关的音频包
@@ -372,6 +414,14 @@ class ConnectionHandler:
             if self._audio_count <= 5 or self._audio_count % 100 == 0:
                 self.logger.bind(tag="AUDIO_DEBUG").info(f"收到音频包 #{self._audio_count}, len={len(message)}, just_woken_up={getattr(self, 'just_woken_up', False)}")
             self.asr_audio_queue.put(message)
+
+    async def _process_asr_message(self, message: bytes | str | tuple[str, int]):
+        if isinstance(message, tuple):
+            message, self.active_listen_start_id = message
+        if isinstance(message, str):
+            await handleTextMessage(self, message)
+        else:
+            await handleAudioMessage(self, message)
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -519,10 +569,6 @@ class ConnectionHandler:
 
             # 初始化声纹识别
             self._initialize_voiceprint()
-            # 打开语音识别通道
-            asyncio.run_coroutine_threadsafe(
-                self.asr.open_audio_channels(self), self.loop
-            )
 
             """加载记忆"""
             self._initialize_memory()
@@ -530,18 +576,39 @@ class ConnectionHandler:
             self._initialize_intent()
             """初始化上报线程"""
             self._init_report_threads()
-            """更新系统提示词"""
-            self._init_prompt_enhancement()
+
+            # 第一轮收音前生成可用提示词，外部上下文刷新不阻塞音频就绪信号。
+            self._init_prompt_enhancement(refresh_context=False)
+            asyncio.run_coroutine_threadsafe(
+                self._open_asr_audio_channels(), self.loop
+            )
+
+            template = self.prompt_manager.base_prompt_template or ""
+            context_fields = ("local_address", "weather_info", "dynamic_context")
+            if any(field in template for field in context_fields):
+                self._init_prompt_enhancement()
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
 
-    def _init_prompt_enhancement(self):
+    async def _open_asr_audio_channels(self):
+        if self.stop_event.is_set():
+            return
+        if self.vad is None or self.asr is None:
+            self.logger.bind(tag=TAG).error("VAD 或 ASR 初始化失败")
+            return
+        try:
+            await self.asr.open_audio_channels(self)
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"打开 ASR 音频通道失败: {e}")
+        else:
+            self.audio_ready_event.set()
 
-        # 更新上下文信息
-        self.prompt_manager.update_context_info(self, self.client_ip)
+    def _init_prompt_enhancement(self, *, refresh_context=True):
+        if refresh_context:
+            self.prompt_manager.update_context_info(self, self.client_ip)
         enhanced_prompt = self.prompt_manager.build_enhanced_prompt(
-            self.config["prompt"],
+            self.config.get("prompt") or "",
             self.device_id,
             self.client_ip,
             emoji_enabled=(self.features or {}).get("emoji", True),
@@ -843,16 +910,8 @@ class ConnectionHandler:
             asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
 
     def change_system_prompt(self, prompt):
-        if not hasattr(self, '_original_prompt') or self._original_prompt is None:
-            self._original_prompt = self.prompt
         self.prompt = prompt
         self.dialogue.update_system_message(self.prompt)
-
-    def restore_default_prompt(self):
-        if hasattr(self, '_original_prompt') and self._original_prompt is not None:
-            self.prompt = self._original_prompt
-            self.dialogue.update_system_message(self.prompt)
-            self._original_prompt = None
 
     def chat(self, query, depth=0):
         if query is not None:

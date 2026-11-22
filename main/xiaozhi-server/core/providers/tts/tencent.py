@@ -10,6 +10,10 @@ from core.providers.tts.base import TTSProviderBase
 
 
 class TTSProvider(TTSProviderBase):
+    REGIONAL_API_HOSTS = {
+        "ap-hongkong": "tts.ap-hongkong.tencentcloudapi.com",
+        "ap-singapore": "tts.intl.tencentcloudapi.com",
+    }
     TTS_PARAM_CONFIG = [
         ("ttsVolume", "volume", -10, 10, 0, lambda v: round(float(v), 1)),
         ("ttsRate", "speed", -2, 6, 0, lambda v: round(float(v), 2)),
@@ -24,8 +28,13 @@ class TTSProvider(TTSProviderBase):
             self.voice = config.get("private_voice")
         else:
             self.voice = int(config.get("voice"))
-        self.api_url = "https://tts.tencentcloudapi.com"  # 正确的API端点
         self.region = config.get("region")
+        self.api_host = self.REGIONAL_API_HOSTS.get(self.region, "tts.tencentcloudapi.com")
+        self.is_international = self.region == "ap-singapore"
+        # 香港是接入地域。TextToVoice 的可选 X-TC-Region 仅支持产品开通地域。
+        if self.region == "ap-hongkong":
+            self.region = None
+        self.api_url = f"https://{self.api_host}"
         self.output_file = config.get("output_dir")
         self.audio_file_type = config.get("format", "wav")
 
@@ -64,9 +73,7 @@ class TTSProvider(TTSProviderBase):
         canonical_querystring = ""
 
         # 请求头必须包含host和content-type，且按字典序排列
-        canonical_headers = (
-            f"content-type:application/json\n" f"host:tts.tencentcloudapi.com\n"
-        )
+        canonical_headers = f"content-type:application/json\nhost:{self.api_host}\n"
         signed_headers = "content-type;host"
 
         # 请求体哈希值
@@ -119,14 +126,15 @@ class TTSProvider(TTSProviderBase):
         # 构建请求头
         headers = {
             "Content-Type": "application/json",
-            "Host": "tts.tencentcloudapi.com",
+            "Host": self.api_host,
             "Authorization": authorization,
             "X-TC-Action": "TextToVoice",
             "X-TC-Timestamp": str(timestamp),
             "X-TC-Version": "2019-08-23",
-            "X-TC-Region": self.region,
             "X-TC-Language": "zh-CN",
         }
+        if self.region:
+            headers["X-TC-Region"] = self.region
 
         return headers
 
@@ -137,6 +145,9 @@ class TTSProvider(TTSProviderBase):
         return hmac.new(key, msg, hashlib.sha256).digest()
 
     async def text_to_speak(self, text, output_file):
+        sample_rate = self.conn.sample_rate
+        if self.is_international and sample_rate not in (8000, 16000):
+            sample_rate = 16000
         # 构建请求体
         request_json = {
             "Text": text,  # 合成语音的源文本
@@ -145,7 +156,7 @@ class TTSProvider(TTSProviderBase):
             "Codec": self.audio_file_type,  # 音频编码格式
             "Volume": self.volume,  # 音量
             "Speed": self.speed,  # 语速
-            "SampleRate": self.conn.sample_rate,  # 采样率部分支持24000
+            "SampleRate": sample_rate,
         }
 
         try:
@@ -154,7 +165,7 @@ class TTSProvider(TTSProviderBase):
 
             # 发送请求
             resp = requests.post(
-                self.api_url, json.dumps(request_json), headers=headers
+                self.api_url, json.dumps(request_json), headers=headers, timeout=(3, 10)
             )
 
             # 检查响应

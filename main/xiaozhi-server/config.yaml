@@ -264,7 +264,7 @@ Intent:
     llm: ChatGLMLLM
     # plugins_func/functions下的模块，可以通过配置，选择加载哪个模块，加载后对话支持相应的function调用
     # 系统默认已经记载"handle_exit_intent(退出识别)"、"play_music(音乐播放)"插件，请勿重复加载
-    # 下面是加载查天气、角色切换、加载查新闻的插件示例
+    # 下面是查天气、查新闻等插件示例
     functions:
       - web_search
       - get_weather
@@ -275,9 +275,9 @@ Intent:
     type: function_call
     # plugins_func/functions下的模块，可以通过配置，选择加载哪个模块，加载后对话支持相应的function调用
     # 系统默认已经记载"handle_exit_intent(退出识别)"、"play_music(音乐播放)"插件，请勿重复加载
-    # 下面是加载查天气、角色切换、加载查新闻的插件示例
+    # 下面是查天气、查新闻等插件示例
     functions:
-      - change_role
+      - lookup_stroke
       - web_search                  # 联网搜索
       - get_weather
       # - search_from_ragflow
@@ -1047,7 +1047,8 @@ TTS:
     appid: 你的腾讯云AppId
     secret_id: 你的腾讯云SecretID
     secret_key: 你的腾讯云SecretKey
-    region: ap-guangzhou
+    # ap-hongkong 选择香港接入域名。国际站账户使用 ap-singapore。
+    region: ap-hongkong
     voice: 101001
     # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
     # 以下可不用设置，使用默认设置

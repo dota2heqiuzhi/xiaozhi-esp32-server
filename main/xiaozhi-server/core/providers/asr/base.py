@@ -18,7 +18,6 @@ from core.providers.asr.dto.dto import InterfaceType
 from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
-from core.handle.receiveAudioHandle import handleAudioMessage
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -46,7 +45,7 @@ class ASRProviderBase(ABC):
             try:
                 message = conn.asr_audio_queue.get(timeout=1)
                 future = asyncio.run_coroutine_threadsafe(
-                    handleAudioMessage(conn, message),
+                    conn._process_asr_message(message),
                     conn.loop,
                 )
                 future.result()
@@ -76,13 +75,15 @@ class ASRProviderBase(ABC):
             if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
                 asr_audio_task = conn.asr_audio.copy()
                 conn.reset_audio_states()
-
-                if len(asr_audio_task) > 15:
-                    await self.handle_voice_stop(conn, asr_audio_task)
+                # VAD already confirmed speech. Short replies can fit in 15 frames.
+                await self.handle_voice_stop(conn, asr_audio_task)
 
     # 处理语音停止
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
         """并行处理ASR和声纹识别"""
+        listen_start_id = conn.active_listen_start_id
+        if listen_start_id != conn.latest_listen_start_id:
+            return
         try:
             total_start_time = time.monotonic()
 
@@ -115,6 +116,10 @@ class ASRProviderBase(ABC):
             else:
                 asr_result = await asr_task
                 voiceprint_result = None
+
+            # A newer listen.start can arrive while recognition is awaiting its result.
+            if listen_start_id != conn.latest_listen_start_id:
+                return
 
             # 记录识别结果 - 检查是否为异常
             if isinstance(asr_result, Exception):
@@ -171,7 +176,7 @@ class ASRProviderBase(ABC):
                 audio_snapshot = asr_audio_task.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
-                await startToChat(conn, enhanced_text)
+                await startToChat(conn, enhanced_text, spoken=True)
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback

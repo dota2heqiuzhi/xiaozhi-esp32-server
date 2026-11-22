@@ -53,6 +53,8 @@ def load_config():
     else:
         # 合并配置
         config = merge_configs(default_config, custom_config)
+        if prompt_template := os.environ.get("XIAOZHI_PROMPT_TEMPLATE"):
+            config["prompt_template"] = prompt_template
     # 初始化目录
     ensure_directories(config)
 
@@ -87,9 +89,13 @@ async def get_config_from_api_async(config):
             "auth_key": config["server"].get("auth_key", ""),
         }
     config_data["server"]["auth"] = {"enabled": auth_enabled}
-    # 如果服务器没有prompt_template，则从本地配置读取
-    if not config_data.get("prompt_template"):
-        config_data["prompt_template"] = config.get("prompt_template")
+    config_data["prompt_template"] = (
+        os.environ.get("XIAOZHI_PROMPT_TEMPLATE")
+        or config_data.get("prompt_template")
+        or config.get("prompt_template")
+    )
+    if "character_lookup" in config:
+        config_data["character_lookup"] = config["character_lookup"]
     return config_data
 
 

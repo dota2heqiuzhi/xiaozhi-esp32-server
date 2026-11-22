@@ -17,6 +17,13 @@ THINKING_DISABLED_DOMAINS = {
     "volces.com": {"thinking": {"type": "disabled"}},
 }
 
+TOKENHUB_HOSTS = {
+    "tokenhub-intl.tencentmaas.com",
+    "tokenhub-intl.tencentmaas.cn",
+    "tokenhub-intl.tencentcloudmaas.com",
+    "tokenhub-intl.tencentcloudmaas.tech",
+}
+
 
 class LLMProvider(LLMProviderBase):
     def __init__(self, config):
@@ -78,9 +85,47 @@ class LLMProvider(LLMProviderBase):
                 msg["content"] = ""
         return dialogue
 
+    def _prepare_dialogue(self, dialogue):
+        if urlparse(self.base_url or "").hostname not in TOKENHUB_HOSTS:
+            return self.normalize_dialogue(dialogue)
+
+        # TokenHub accepts one optional system message before the conversation.
+        # The app supplies the persona and per-turn context as separate messages.
+        messages = self.normalize_dialogue([message.copy() for message in dialogue])
+        system_text = "\n\n".join(
+            message["content"]
+            for message in messages
+            if message.get("role") == "system" and message["content"]
+        )
+        turns = []
+        for message in messages:
+            role = message.get("role")
+            if role == "system":
+                continue
+            # A temporary reminder may immediately precede the child's user turn.
+            if (
+                role == "user"
+                and turns
+                and turns[-1].get("role") == "user"
+                and turns[-1].get("name") == message.get("name")
+                and isinstance(turns[-1]["content"], str)
+                and isinstance(message["content"], str)
+            ):
+                turns[-1]["content"] += "\n\n" + message["content"]
+            else:
+                turns.append(message)
+        if system_text:
+            turns.insert(0, {"role": "system", "content": system_text})
+        return turns
+
     def _apply_thinking_disabled(self, request_params: dict):
         """根据域名自动禁用思考模式"""
+        if not self.base_url:
+            return
         parsed_url = urlparse(self.base_url)
+        if parsed_url.hostname in TOKENHUB_HOSTS and self.model_name == "hy4-flash":
+            request_params.setdefault("extra_body", {})["thinking"] = {"type": "disabled"}
+            return
         domain = parsed_url.netloc
         for disabled_domain, params in THINKING_DISABLED_DOMAINS.items():
             if disabled_domain in domain:
@@ -89,7 +134,7 @@ class LLMProvider(LLMProviderBase):
                 break
 
     def response(self, session_id, dialogue, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
+        dialogue = self._prepare_dialogue(dialogue)
 
         request_params = {
             "model": self.model_name,
@@ -135,7 +180,7 @@ class LLMProvider(LLMProviderBase):
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
+        dialogue = self._prepare_dialogue(dialogue)
 
         request_params = {
             "model": self.model_name,

@@ -37,16 +37,6 @@ _wakeup_response_lock = asyncio.Lock()
 
 async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
     """处理hello消息"""
-    # 每次新连接（hello）时，重置角色为默认小智
-    # 因为新连接的 prompt 总是从数据库加载的默认角色，
-    # 必须让 _current_role 与之同步，否则双击 toggle 方向会反
-    try:
-        import plugins_func.functions.change_role as cr_module
-        cr_module._current_role = "默认小智"
-        conn.logger.bind(tag=TAG).debug("已重置角色状态为默认小智")
-    except Exception:
-        pass
-
     audio_params = msg_json.get("audio_params")
     if audio_params:
         format = audio_params.get("format")

@@ -30,20 +30,22 @@ class ListenTextMessageHandler(TextMessageHandler):
             )
         if msg_json["state"] == "start":
             # 设备从播放模式切回录音模式,清除所有音频状态和缓冲区
+            conn.just_woken_up = False
+            resume_task = getattr(conn, "vad_resume_task", None)
+            if resume_task is not None and not resume_task.done():
+                resume_task.cancel()
             conn.reset_audio_states()
         elif msg_json["state"] == "stop":
-            conn.client_voice_stop = True
             if conn.asr.interface_type == InterfaceType.STREAM:
                 # 流式模式下，发送结束请求
+                conn.client_voice_stop = True
                 asyncio.create_task(conn.asr._send_stop_request())
             else:
-                # 非流式模式：直接触发ASR识别
-                if len(conn.asr_audio) > 0:
-                    asr_audio_task = conn.asr_audio.copy()
-                    conn.reset_audio_states()
-
-                    if len(asr_audio_task) > 0:
-                        await conn.asr.handle_voice_stop(conn, asr_audio_task)
+                has_speech = conn.client_listen_mode == "manual" or conn.client_have_voice
+                asr_audio_task = conn.asr_audio.copy() if has_speech else []
+                conn.reset_audio_states()
+                if asr_audio_task:
+                    await conn.asr.handle_voice_stop(conn, asr_audio_task)
         elif msg_json["state"] == "detect":
             conn.client_have_voice = False
             conn.reset_audio_states()
